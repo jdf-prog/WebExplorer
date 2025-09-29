@@ -49,6 +49,8 @@ WebExplorer introduces a systematic approach for training long-horizon web agent
 | WebSailor-32B | 10.5 | 25.5 | 53.2 | - | - | 53.3 | - |
 | WebSailor-7B | 6.7 | 14.2 | 33.0 | - | - | 34.3 | - |
 | ASearcher-Web-QwQ | 5.2 | 15.6 | 52.8 | 34.3 | 70.9 | 42.1 | 12.5 |
+| AFM-32B | 11.1 | - | 55.3 | 63.0 | - | - | 18.0 |
+| AFM-7B | 5.8 | - | 40.8 | 55.6 | - | - | 15.6 |
 | WebThinker-32B | 2.8 | - | 48.5 | 46.5 | - | - | 15.8 |
 | MiroThinker-32B-DPO-v0.1 | 13.0 | 17.0 | 57.3 | 49.3 | 71.7 | - | 11.8 |
 | MiroThinker-8B-DPO-v0.1 | 8.7 | 13.6 | 46.6 | 45.7 | 64.4 | - | - |
