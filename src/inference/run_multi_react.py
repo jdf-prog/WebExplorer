@@ -22,7 +22,7 @@ if __name__ == "__main__":
     parser.add_argument("--total_splits", type=int, default=1)
     parser.add_argument("--worker_split", type=int, default=1)
     parser.add_argument("--auto_judge", action="store_true", help="Enable automatic judging of answers")
-    parser.add_argument("--judge_engine", type=str, default="deepseekchat", choices=["deepseekchat", "geminiflash"], help="LLM engine for auto judging")
+    parser.add_argument("--judge_engine", type=str, default="deepseekchat", choices=["deepseekchat", "geminiflash", "openai"], help="LLM engine for auto judging")
     args = parser.parse_args()
 
     model = args.model
@@ -113,8 +113,10 @@ if __name__ == "__main__":
 
     tasks_to_run_all = []
     per_rollout_task_counts = {i: 0 for i in range(1, roll_out_count + 1)}
-    # Define ports
-    planning_ports = [6001, 6002, 6003, 6004, 6005, 6006, 6007, 6008]
+    planning_ports_env = os.getenv("WEBEXPLORER_VLLM_PORTS", "6001,6002,6003,6004,6005,6006,6007,6008")
+    planning_ports = [int(port.strip()) for port in planning_ports_env.split(",") if port.strip()]
+    if not planning_ports:
+        raise ValueError("WEBEXPLORER_VLLM_PORTS must contain at least one port")
     # Round-robin state
     planning_rr_idx = 0
     summary_rr_idx = 0

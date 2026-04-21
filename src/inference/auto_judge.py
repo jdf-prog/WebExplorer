@@ -82,6 +82,43 @@ def get_deepseekchat_response(query: str, temperature: float = 0.0, max_retry: i
     return None
 
 
+def get_openai_response(query: str, temperature: float = 0.0, max_retry: int = 5) -> str:
+    """Get response from OpenAI API for auto judging."""
+    api_key = os.environ.get("API_KEY")
+    api_base = os.environ.get("API_BASE", "https://api.openai.com/v1")
+    model_name = os.environ.get("JUDGE_MODEL_NAME") or os.environ.get("SUMMARY_MODEL_NAME", "")
+
+    if not api_key or not model_name:
+        print("Warning: API_KEY or judge model name not set, skipping OpenAI response", flush=True)
+        return None
+
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            base_url=api_base
+        )
+
+        for retry_cnt in range(max_retry):
+            try:
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": query}],
+                    temperature=temperature
+                )
+                content = response.choices[0].message.content
+                if content:
+                    return content
+            except Exception as e:
+                print(f"get_openai_response {retry_cnt} error: {e}", flush=True)
+                if retry_cnt == max_retry - 1:
+                    return None
+                time.sleep(random.uniform(4, 16))
+    except Exception as e:
+        print(f"Failed to initialize OpenAI client: {e}", flush=True)
+
+    return None
+
+
 def normalize_answer(s):
     """Normalize answer for comparison."""
     def remove_articles(text):
@@ -182,7 +219,7 @@ def compute_score_genrm(prediction: str, ground_truth: str, question: str, engin
         prediction: The final prediction/answer content (not the full conversation)
         ground_truth: The correct answer(s) 
         question: The original question
-        engine: LLM engine to use for judging ("deepseekchat" or "geminiflash")
+        engine: LLM engine to use for judging ("deepseekchat", "geminiflash", or "openai")
     
     Returns:
         Dict containing score, extracted_answer, and judge_response
@@ -198,6 +235,8 @@ def compute_score_genrm(prediction: str, ground_truth: str, question: str, engin
     try:
         if engine == "geminiflash":
             judge_response = get_geminiflash_response(judge_prompt, max_retry=3)
+        elif engine == "openai":
+            judge_response = get_openai_response(judge_prompt, max_retry=3)
         else:  # default to deepseekchat
             judge_response = get_deepseekchat_response(judge_prompt, max_retry=3)
         

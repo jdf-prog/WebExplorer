@@ -239,8 +239,10 @@ class WebExplorerBrowse(BaseTool):
 
     def __init__(self, cfg: Optional[dict] = None):
         super().__init__(cfg)
-        self.read_engine = cfg.get("read_engine", "jina") if cfg else "jina"
-        self.generate_engine = cfg.get("generate_engine", "deepseekchat") if cfg else "deepseekchat"
+        default_read_engine = os.environ.get("BROWSE_READ_ENGINE", "jina")
+        default_generate_engine = os.environ.get("BROWSE_ENGINE", "deepseekchat")
+        self.read_engine = cfg.get("read_engine", default_read_engine) if cfg else default_read_engine
+        self.generate_engine = cfg.get("generate_engine", default_generate_engine) if cfg else default_generate_engine
         self.max_retry = cfg.get("max_retry", 3) if cfg else 3
 
     def call(self, params: Union[str, dict], **kwargs) -> str:

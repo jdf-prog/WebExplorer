@@ -1,0 +1,21 @@
+# Minimal dependencies for the current WebExplorer inference pipeline.
+# This covers:
+# - run_multi_react.py
+# - react_agent.py
+# - tool_webexplorer_search.py
+# - tool_webexplorer_browse.py
+# - auto_judge.py
+
+json5==0.12.1
+openai==1.99.5
+qwen-agent==0.0.26
+requests==2.32.5
+tiktoken==0.11.0
+tqdm==4.67.1
+transformers==4.56.1
+
+# Optional but recommended for tokenizer compatibility with some HF models.
+sentencepiece==0.2.1
+
+# Add this only if you also want to run the local vLLM server in the same env.
+# vllm==0.10.1
