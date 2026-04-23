@@ -58,6 +58,8 @@ class MultiTurnReactAgent(FnCallAgent):
 
         self.llm_generate_cfg = llm["generate_cfg"]
         self.llm_local_path = llm["model"]
+        self.context_management_strategy = os.getenv("CONTEXT_MANAGEMENT_STRATEGY", "none").strip().lower()
+        self.context_reset_threshold = float(os.getenv("CONTEXT_RESET_THRESHOLD", "0.3"))
 
     def sanity_check_output(self, content):
         return "<think>" in content and "</think>" in content
@@ -145,6 +147,37 @@ class MultiTurnReactAgent(FnCallAgent):
         
         return len(tokenizer.encode(full_prompt))
 
+    def maybe_reset_context(self, messages, question):
+        if self.context_management_strategy != "discard_all":
+            return messages, False, None
+
+        max_input_tokens = self.llm_generate_cfg.get("max_input_tokens", 320000)
+        reset_threshold_tokens = int(max_input_tokens * self.context_reset_threshold)
+        token_count = self.count_tokens(messages)
+        reset_info = {
+            "strategy": self.context_management_strategy,
+            "token_count": token_count,
+            "threshold": reset_threshold_tokens,
+            "max_input_tokens": max_input_tokens,
+            "threshold_ratio": self.context_reset_threshold,
+        }
+
+        print(
+            f"context management: strategy={self.context_management_strategy}, "
+            f"token_count={token_count}, reset_threshold={reset_threshold_tokens}",
+            flush=True
+        )
+
+        if token_count > reset_threshold_tokens:
+            print(
+                f"context management: resetting conversation history because "
+                f"{token_count} > {reset_threshold_tokens}",
+                flush=True
+            )
+            return [{"role": "user", "content": question}], True, reset_info
+
+        return messages, False, reset_info
+
     def _run(self, data: str, model: str, auto_judge: bool = False, judge_engine: str = "deepseekchat", **kwargs) -> List[List[Message]]:
         self.model=model
         try:
@@ -162,6 +195,7 @@ class MultiTurnReactAgent(FnCallAgent):
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": question}]
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
         round = 0
+        context_reset_events = []
         while num_llm_calls_available > 0:
             # Check whether time is reached
             if time.time() - start_time > 150 * 60:  # 150 minutes in seconds
@@ -170,9 +204,12 @@ class MultiTurnReactAgent(FnCallAgent):
                 result = {
                     "question": question,
                     "answer": answer,
+                    "round": round,
                     "messages": messages,
                     "prediction": prediction,
-                    "termination": termination
+                    "termination": termination,
+                    "discard_all_count": len(context_reset_events),
+                    "context_reset_events": context_reset_events
                 }
                 result = self.add_auto_judge(result, auto_judge, judge_engine, messages, question, answer)
                 return result
@@ -217,12 +254,27 @@ class MultiTurnReactAgent(FnCallAgent):
                 result = {
                     "question": question,
                     "answer": answer,
+                    "round": round,
                     "messages": messages,
                     "prediction": prediction,
-                    "termination": termination
+                    "termination": termination,
+                    "discard_all_count": len(context_reset_events),
+                    "context_reset_events": context_reset_events
                 }
                 result = self.add_auto_judge(result, auto_judge, judge_engine, messages, question, answer)
                 return result
+
+            messages_before_reset = len(messages)
+            messages, context_reset, reset_info = self.maybe_reset_context(messages, question)
+            if context_reset:
+                context_reset_events.append({
+                    "round": round,
+                    "messages_before_reset": messages_before_reset,
+                    "messages_after_reset": len(messages),
+                    "num_llm_calls_available": num_llm_calls_available,
+                    **(reset_info or {}),
+                })
+                continue
 
             max_tokens = 108 * 1024
             token_count = self.count_tokens(messages)
@@ -239,9 +291,12 @@ class MultiTurnReactAgent(FnCallAgent):
                 result = {
                     "question": question,
                     "answer": answer,
+                    "round": round,
                     "messages": messages,
                     "prediction": prediction,
-                    "termination": termination
+                    "termination": termination,
+                    "discard_all_count": len(context_reset_events),
+                    "context_reset_events": context_reset_events
                 }
                 result = self.add_auto_judge(result, auto_judge, judge_engine, messages, question, answer)
                 return result
@@ -256,9 +311,12 @@ class MultiTurnReactAgent(FnCallAgent):
         result = {
             "question": question,
             "answer": answer,
+            "round": round,
             "messages": messages,
             "prediction": prediction,
-            "termination": termination
+            "termination": termination,
+            "discard_all_count": len(context_reset_events),
+            "context_reset_events": context_reset_events
         }
         result = self.add_auto_judge(result, auto_judge, judge_engine, messages, question, answer)
         return result

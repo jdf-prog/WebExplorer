@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import random
 import requests
@@ -9,6 +10,16 @@ import tiktoken
 
 
 JINA_API_KEY = os.getenv("JINA_API_KEYS", "")
+
+
+def strip_think_blocks(text: Optional[str]) -> Optional[str]:
+    """Remove reasoning blocks that some local models emit in plain content."""
+    if text is None:
+        return None
+
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = cleaned.replace("<think>", "").replace("</think>", "")
+    return cleaned.strip()
 
 def get_geminiflash_response(query: str, temperature: float = 0.0, max_retry: int = 5) -> str:
     """Get response from Gemini Flash model using standard OpenAI-compatible API."""
@@ -35,7 +46,7 @@ def get_geminiflash_response(query: str, temperature: float = 0.0, max_retry: in
                 )
                 content = response.choices[0].message.content
                 if content:
-                    return content
+                    return strip_think_blocks(content)
             except Exception as e:
                 print(f"get_geminiflash_response {retry_cnt} error: {e}", flush=True)
                 if retry_cnt == max_retry - 1:
@@ -72,7 +83,7 @@ def get_deepseekchat_response(query: str, temperature: float = 0.0, max_retry: i
                 )
                 content = response.choices[0].message.content
                 if content:
-                    return content
+                    return strip_think_blocks(content)
             except Exception as e:
                 print(f"get_deepseekchat_response {retry_cnt} error: {e}", flush=True)
                 if retry_cnt == max_retry - 1:
@@ -106,7 +117,7 @@ def get_openai_response(query: str, temperature: float = 0.0, max_retry: int = 3
                 temperature=temperature
             )
             content = chat_response.choices[0].message.content
-            return content
+            return strip_think_blocks(content)
         except Exception as e:
             print(f"get_openai_response {attempt} error: {e}", flush=True)
             if attempt == max_retry - 1:

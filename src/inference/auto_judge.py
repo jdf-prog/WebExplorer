@@ -121,6 +121,9 @@ def get_openai_response(query: str, temperature: float = 0.0, max_retry: int = 5
 
 def normalize_answer(s):
     """Normalize answer for comparison."""
+    if s is None:
+        return ""
+
     def remove_articles(text):
         return re.sub(r"\b(a|an|the)\b", " ", text)
 
@@ -135,6 +138,15 @@ def normalize_answer(s):
         return text.lower()
 
     return white_space_fix(remove_articles(remove_punc(lower(s))))
+
+
+def strip_think_blocks(text: Optional[str]) -> str:
+    """Remove <think> blocks from model outputs before parsing."""
+    if text is None:
+        return ""
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = cleaned.replace("<think>", "").replace("</think>", "")
+    return cleaned.strip()
 
 
 def extract_xml_field(reply, field):
@@ -152,9 +164,10 @@ def extract_xml_field(reply, field):
 
 def extract_solution(solution_str):
     """Extract the answer from the solution string."""
+    solution_str = strip_think_blocks(solution_str)
     # Handle different message formats
     if "<|im_start|>assistant" in solution_str:
-        extract_solution_str = solution_str.split("<|im_start|>assistant")[-1].split("</think>")[-1].replace("<|im_end|>", "").strip()
+        extract_solution_str = solution_str.split("<|im_start|>assistant")[-1].replace("<|im_end|>", "").strip()
     else:
         # Handle normal conversation format or direct prediction content
         extract_solution_str = solution_str.strip()
@@ -188,27 +201,47 @@ def em_check(prediction, golden_answers):
 
 
 JUDGE_PROMPT = """
-Judge whether the following [response] to [question] is correct, based on the [ground_truth] below. [ground_truth] is a list of correct answers.
+Judge whether the following [response] to [question] is correct or not based on the precise and unambiguous [correct_answer] below.
 
 [question]: %s
 
 [response]: %s
 
-[ground_truth]: %s
+Your judgement must follow the instructions below.
 
-You need to first extract the final answer from the [response], then give a label "yes" or "no" based on if the extracted_final_answer matches the [ground_truth].
-Your judgement must be in the following format:
+extracted_final_answer: The final exact answer extracted from the [response]. Put None if there is no exact, final answer to extract from the response.
 
-<reasoning>
-<!-- Think briefly about what is the extracted_final_answer, and why the extracted_final_answer is correct or incorrect based on [ground_truth]. Focus only on if there are meaningful differences between [ground_truth] and the extracted_final_answer. -->
-</reasoning>
-<extracted_final_answer>
-<!-- The final exact answer extracted from the [response]. The [response] must be confident, definite and clear. It cannot be a guess or a general prediction. The extracted_final_answer must be unambiguous. Otherwise, return "no answer". -->
-</extracted_final_answer>
-<label>
-<!-- 'yes' if the extracted_final_answer matches the [ground_truth], otherwise 'no'. -->
-</label>
+[correct_answer]: %s
+
+reasoning: Explain why the extracted_final_answer is correct or incorrect based on [correct_answer], focusing only on whether there are meaningful differences between them. Ignore superficial formatting differences that do not change meaning, including capitalization, extra spaces, punctuation-only differences, Unicode quote/dash variants, and equivalent numbering styles such as "ODI no #1880" vs "ODI no. 1880". Do not comment on background to the problem, do not try to solve the problem again, and do not argue for an answer different from [correct_answer].
+
+correct: Answer yes if extracted_final_answer matches [correct_answer], or is within a small margin of error for numerical problems. Answer no otherwise.
+
+confidence: The extracted confidence score between 0%% and 100%% from [response]. Put 100 if there is no confidence score available.
+
+Return exactly in this format:
+extracted_final_answer: <answer or None>
+reasoning: <brief reasoning>
+correct: <yes or no>
+confidence: <integer 0-100>
 """
+
+
+JUDGE_FIELDS = ["extracted_final_answer", "reasoning", "correct", "confidence"]
+
+
+def extract_prefixed_field(reply: str, field: str) -> str:
+    """Extract a `field: value` section from judge output."""
+    if reply is None:
+        raise ValueError(f"Failed to extract {field} field")
+
+    other_fields = [f for f in JUDGE_FIELDS if f != field]
+    lookahead = "|".join(re.escape(name) for name in other_fields)
+    pattern = rf"(?:^|\n){re.escape(field)}:\s*(.*?)(?=\n(?:{lookahead}):|\Z)"
+    result = re.search(pattern, reply, flags=re.DOTALL | re.IGNORECASE)
+    if result:
+        return result.group(1).strip()
+    raise ValueError(f"Failed to extract {field} field")
 
 
 def compute_score_genrm(prediction: str, ground_truth: str, question: str, engine: str = "deepseekchat") -> Dict[str, Any]:
@@ -239,26 +272,44 @@ def compute_score_genrm(prediction: str, ground_truth: str, question: str, engin
             judge_response = get_openai_response(judge_prompt, max_retry=3)
         else:  # default to deepseekchat
             judge_response = get_deepseekchat_response(judge_prompt, max_retry=3)
-        
+
+        judge_response = strip_think_blocks(judge_response)
+        normalized_em = em_check(answer, ground_truth)
+
         try:
-            label = extract_xml_field(judge_response, "label")
+            judge_extracted_answer = extract_prefixed_field(judge_response, "extracted_final_answer")
+            reasoning = extract_prefixed_field(judge_response, "reasoning")
+            label = extract_prefixed_field(judge_response, "correct")
+            confidence = extract_prefixed_field(judge_response, "confidence")
+
             if "yes" in label.lower():
                 score = 1
             else:
                 score = 0
         except:
-            # If XML parsing fails, try simple text matching
-            if "yes" in judge_response.lower() and "no" not in judge_response.lower():
+            judge_extracted_answer = None
+            reasoning = None
+            confidence = None
+            # If structured parsing fails, try simple text matching
+            if "correct: yes" in judge_response.lower():
                 score = 1
             else:
                 score = 0
-                
+
+        # Fallback to normalized exact match for equivalent formatting variants.
+        if score == 0 and normalized_em == 1:
+            score = 1
+
         result = {
             "score": score,
             "extracted_answer": answer,
             "judge_response": judge_response,
             "ground_truth": ground_truth,
-            "question": question
+            "question": question,
+            "normalized_em": normalized_em,
+            "judge_extracted_final_answer": judge_extracted_answer,
+            "judge_reasoning": reasoning,
+            "judge_confidence": confidence,
         }
         
         print(f"Auto Judge Result: Score={score}, Answer='{answer}', Ground Truth='{ground_truth}'")
