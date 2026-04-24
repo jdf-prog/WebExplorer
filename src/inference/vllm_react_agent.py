@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import random
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,6 +54,16 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def strip_think_blocks(text: Optional[str]) -> str:
+    if text is None:
+        return ""
+
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<think>.*\Z", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = cleaned.replace("<think>", "").replace("</think>", "")
+    return cleaned.strip()
+
+
 class MultiTurnReactAgent(FnCallAgent):
     def __init__(
         self,
@@ -71,6 +82,9 @@ class MultiTurnReactAgent(FnCallAgent):
         )
         self.context_total_token_limit = int(
             os.getenv("CONTEXT_TOTAL_TOKEN_LIMIT", "1000000")
+        )
+        self.context_summary_max_tokens = int(
+            os.getenv("CONTEXT_SUMMARY_MAX_TOKENS", "4096")
         )
         self.tokenizer = None
         self._tokenizer_initialized = False
@@ -155,6 +169,15 @@ class MultiTurnReactAgent(FnCallAgent):
             {key: value for key, value in message.items() if not key.startswith("_")}
             for message in copy.deepcopy(messages)
         ]
+
+    def _move_thinking_to_reasoning_content(self, message: Dict) -> None:
+        thinking_payload = message.pop("thinking", None)
+        if message.get("reasoning_content") or thinking_payload is None:
+            return
+        if isinstance(thinking_payload, dict):
+            message["reasoning_content"] = thinking_payload.get("thinking") or ""
+        elif isinstance(thinking_payload, str):
+            message["reasoning_content"] = thinking_payload
 
     def _normalize_usage(self, usage) -> Optional[Dict]:
         if usage is None:
@@ -245,14 +268,32 @@ class MultiTurnReactAgent(FnCallAgent):
         if not usage:
             return
 
-        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-            value = usage.get(key)
-            if value is None:
-                continue
-            try:
-                cumulative_usage[key] += int(value)
-            except (TypeError, ValueError):
-                continue
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        billable_total_tokens = usage.get("total_tokens")
+
+        try:
+            if prompt_tokens is not None:
+                cumulative_usage["prompt_tokens"] += int(prompt_tokens)
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            if completion_tokens is not None:
+                completion_value = int(completion_tokens)
+                cumulative_usage["completion_tokens"] += completion_value
+                # For eval, `total_tokens` tracks generated tokens only.
+                cumulative_usage["total_tokens"] += completion_value
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            if billable_total_tokens is not None:
+                cumulative_usage["billable_total_tokens"] += int(
+                    billable_total_tokens
+                )
+        except (TypeError, ValueError):
+            pass
 
         if usage.get("estimated"):
             cumulative_usage["estimated_calls"] += 1
@@ -272,66 +313,225 @@ class MultiTurnReactAgent(FnCallAgent):
             "summary_count": summary_count,
             "context_reset_events": context_events,
             "cumulative_token_usage": copy.deepcopy(cumulative_usage),
+            "cumulative_token_usage_metric": "completion_tokens",
             "context_total_token_limit": self.context_total_token_limit,
             "context_summary_trigger_tokens": self.context_summary_trigger_tokens,
+            "context_summary_max_tokens": self.context_summary_max_tokens,
         }
 
     def _latest_assistant_content(self, messages: List[Dict]) -> str:
         for message in reversed(messages):
             if message.get("role") == "assistant" and message.get("content"):
-                return message["content"]
+                return strip_think_blocks(message["content"])
         return ""
+
+    def _format_message_for_summary(self, message: Dict, step_idx: int) -> str:
+        role = message.get("role", "unknown")
+        lines = [f"[step {step_idx}] {role}"]
+
+        if role == "assistant":
+            reasoning_content = strip_think_blocks(
+                message.get("reasoning_content") or ""
+            )
+            content = strip_think_blocks(message.get("content") or "")
+            if reasoning_content:
+                lines.extend(["<think>", reasoning_content, "</think>"])
+            tool_calls = message.get("tool_calls") or []
+            if tool_calls:
+                lines.append("<tool_calls>")
+                for tool_call in tool_calls:
+                    lines.append(
+                        json.dumps(tool_call, ensure_ascii=False, indent=4)
+                    )
+                lines.append("</tool_calls>")
+            if content:
+                lines.append(content)
+        else:
+            content = strip_think_blocks(message.get("content") or "")
+            if content:
+                lines.append(content)
+
+        return "\n".join(lines)
+
+    def _format_conversation_history_for_summary(
+        self, messages: List[Dict]
+    ) -> str:
+        stripped_messages = self._strip_internal_message_fields(messages)
+        return "\n".join(
+            self._format_message_for_summary(message, idx)
+            for idx, message in enumerate(stripped_messages)
+        )
 
     def _build_summary_request_messages(
         self, messages: List[Dict], question: str
     ) -> List[Dict]:
-        stripped_messages = self._strip_internal_message_fields(messages)
-        transcript = json.dumps(stripped_messages, ensure_ascii=False)
-        return [
-            {
-                "role": "system",
-                "content": (
-                    "You summarize a web research agent's prior interaction so it can "
-                    "continue later with less context. Preserve established facts, "
-                    "important evidence, URLs or source names when available, tool "
-                    "results worth remembering, failed paths, remaining uncertainties, "
-                    "and the current best candidate answer. Do not invent facts."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Original question:\n{question}\n\n"
-                    "Conversation history to summarize:\n"
-                    f"{transcript}\n\n"
-                    "Write a compact continuation summary with these sections:\n"
-                    "1. Facts established\n"
-                    "2. Evidence and sources\n"
-                    "3. Open questions\n"
-                    "4. Current plan\n"
-                    "5. Best current answer candidate"
-                ),
-            },
-        ]
+        transcript = self._format_conversation_history_for_summary(messages)
+        summary_prompt = f"""Your task is to create a detailed summary of the conversation so far,
+paying close attention to the user's explicit requests and your previous actions.
+This summary should be thorough in capturing technical details, code patterns,
+and architectural decisions that would be essential for continuing development
+work without losing context.
+Before providing your final summary, organize your thoughts in an "## Analysis"
+section to ensure you've covered all necessary points. In your analysis process:
+1. Chronologically analyze each message and section of the conversation. For
+   each section thoroughly identify:
+   - The user's explicit requests and intents
+   - Your approach to addressing the user's requests
+   - Key decisions, technical concepts and code patterns
+   - Specific details like file names, full code snippets, function signatures,
+     file edits, etc
+2. Double-check for technical accuracy and completeness, addressing each
+   required element thoroughly.
+Your summary should include the following sections:
+1. Primary Request and Intent: Capture all of the user's explicit requests and
+   intents in detail
+2. Key Technical Concepts: List all important technical concepts, technologies,
+   and frameworks discussed.
+3. Files and Code Sections: Enumerate specific files and code sections
+   examined, modified, or created. Pay special attention to the most recent
+   messages and include full code snippets where applicable and include a
+   summary of why this file read or edit is important.
+4. Problem Solving: Document problems solved and any ongoing troubleshooting
+   efforts.
+5. Pending Tasks: Outline any pending tasks that you have explicitly been
+   asked to work on.
+6. Current Work: Describe in detail precisely what was being worked on
+   immediately before this summary request, paying special attention to the
+   most recent messages from both user and assistant. Include file names and
+   code snippets where applicable.
+7. Optional Next Step: List the next step that you will take that is related
+   to the most recent work you were doing. IMPORTANT: ensure that this step
+   is DIRECTLY in line with the user's explicit requests, and the task you
+   were working on immediately before this summary request. If your last task
+   was concluded, then only list next steps if they are explicitly in line
+   with the users request. Do not start on tangential requests without
+   confirming with the user first.
+8. If there is a next step, include direct quotes from the most recent
+   conversation showing exactly what task you were working on and where you
+   left off. This should be verbatim to ensure there's no drift in task
+   interpretation.
+Here's an example of how your output should be structured:
+---
+## Analysis
+[Your thought process, ensuring all points are covered thoroughly and accurately]
+## Summary
+### 1. Primary Request and Intent
+...
+### 7. Optional Next Step
+[Optional Next step to take]
+---
+Please provide your summary based on the conversation so far, following this
+structure and ensuring precision and thoroughness in your response.
 
-    def _build_messages_from_summary(
-        self, system_prompt: str, question: str, summary_text: str
+
+
+
+[USER]
+{question}
+<conversation_history>
+{transcript}
+</conversation_history>
+Directly output the summary content without any other text."""
+        return [{"role": "user", "content": summary_prompt}]
+
+    def _last_user_message(self, messages: List[Dict], question: str) -> Dict:
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                return copy.deepcopy(message)
+        return {"role": "user", "content": question}
+
+    def _build_messages_after_summary(
+        self, messages: List[Dict], system_prompt: str, question: str
     ) -> List[Dict]:
-        return [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": (
-                    f"{question}\n\n"
-                    "Context summary from previous turns. Treat this as authoritative "
-                    "memory of prior work and continue from here without restarting:\n\n"
-                    f"{summary_text}"
-                ),
-            },
-        ]
+        system_messages = []
+        if messages and messages[0].get("role") == "system":
+            system_messages.append(copy.deepcopy(messages[0]))
+        elif system_prompt:
+            system_messages.append({"role": "system", "content": system_prompt})
+
+        return system_messages + [self._last_user_message(messages, question)]
+
+    def _append_summary_to_thinking(self, thinking_content: str, summary_text: str) -> str:
+        formatted_summary = (
+            "<minimax:context_summary>\n"
+            f"{summary_text}\n"
+            "</minimax:context_summary>\n\n"
+        )
+        return f"{thinking_content}{formatted_summary}"
+
+    def _inject_pending_summary_to_thinking(
+        self, messages: List[Dict], pending_summary: Optional[str]
+    ) -> bool:
+        if not pending_summary:
+            return False
+
+        for message in reversed(messages):
+            if message.get("role") != "assistant":
+                continue
+
+            thinking_payload = message.get("thinking")
+            if isinstance(thinking_payload, dict):
+                thinking_content = strip_think_blocks(
+                    thinking_payload.get("thinking") or ""
+                )
+                thinking_payload["thinking"] = self._append_summary_to_thinking(
+                    thinking_content,
+                    pending_summary,
+                )
+                return True
+            if isinstance(thinking_payload, str):
+                message["thinking"] = self._append_summary_to_thinking(
+                    strip_think_blocks(thinking_payload),
+                    pending_summary,
+                )
+                return True
+
+            if message.get("reasoning_content"):
+                reasoning_content = strip_think_blocks(message["reasoning_content"])
+                message["reasoning_content"] = self._append_summary_to_thinking(
+                    reasoning_content,
+                    pending_summary,
+                )
+                return True
+
+            content = message.get("content") or ""
+            think_match = re.search(
+                r"<think>(.*?)</think>",
+                content,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            if think_match:
+                thinking_content = strip_think_blocks(think_match.group(1))
+                new_thinking = (
+                    "<think>"
+                    + self._append_summary_to_thinking(
+                        thinking_content,
+                        pending_summary,
+                    )
+                    + "</think>"
+                )
+                message["content"] = (
+                    content[: think_match.start()]
+                    + new_thinking
+                    + content[think_match.end() :]
+                )
+                return True
+
+            message["content"] = (
+                "<think>"
+                + self._append_summary_to_thinking("", pending_summary)
+                + "</think>\n"
+                + content
+            )
+            return True
+
+        return False
 
     def _prepare_messages_for_api(self, messages: List[Dict]) -> List[Dict]:
         api_messages = self._strip_internal_message_fields(messages)
+
+        for message in api_messages:
+            self._move_thinking_to_reasoning_content(message)
 
         for message in api_messages:
             if message.get("role") != "assistant":
@@ -351,6 +551,9 @@ class MultiTurnReactAgent(FnCallAgent):
 
     def _prepare_messages_for_template(self, messages: List[Dict]) -> List[Dict]:
         template_messages = self._strip_internal_message_fields(messages)
+
+        for message in template_messages:
+            self._move_thinking_to_reasoning_content(message)
 
         for message in template_messages:
             if message.get("role") != "assistant":
@@ -651,8 +854,11 @@ class MultiTurnReactAgent(FnCallAgent):
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
+            "billable_total_tokens": 0,
             "estimated_calls": 0,
         }
+        pending_summary_for_thinking = None
+        history_context = []
 
         def finalize_result(prediction: str, termination_reason: str):
             result = {
@@ -728,6 +934,14 @@ class MultiTurnReactAgent(FnCallAgent):
                 termination = "No answer found after 2h30mins"
                 return finalize_result(prediction, termination)
 
+            if pending_summary_for_thinking:
+                injected = self._inject_pending_summary_to_thinking(
+                    messages,
+                    pending_summary_for_thinking,
+                )
+                if injected:
+                    pending_summary_for_thinking = None
+
             round += 1
             num_llm_calls_available -= 1
             request_messages = copy.deepcopy(messages)
@@ -790,7 +1004,7 @@ class MultiTurnReactAgent(FnCallAgent):
                     cumulative_token_usage,
                     self._get_call_usage(final_request_messages, assistant_message),
                 )
-                prediction = messages[-1]["content"]
+                prediction = strip_think_blocks(messages[-1].get("content") or "")
                 termination = "exceed_llm_calls"
                 self._emit_progress(
                     progress_callback,
@@ -860,17 +1074,21 @@ class MultiTurnReactAgent(FnCallAgent):
                         summary_request_messages,
                         planning_port,
                         use_tools=False,
-                        max_tokens=2048,
+                        max_tokens=self.context_summary_max_tokens,
                     )
                     summary_usage = self._get_call_usage(
                         summary_request_messages, summary_message
                     )
                     self._accumulate_usage(cumulative_token_usage, summary_usage)
-                    summary_text = (summary_message.get("content") or "").strip()
-                    messages = self._build_messages_from_summary(
+                    summary_text = strip_think_blocks(
+                        summary_message.get("content") or ""
+                    )
+                    pending_summary_for_thinking = summary_text
+                    history_context.append(copy.deepcopy(messages))
+                    messages = self._build_messages_after_summary(
+                        messages,
                         system_prompt,
                         question,
-                        summary_text,
                     )
                     reset_event = {
                         "round": round,
@@ -880,6 +1098,8 @@ class MultiTurnReactAgent(FnCallAgent):
                         "num_llm_calls_available": num_llm_calls_available,
                         "summary_text": summary_text,
                         "summary_usage": summary_usage,
+                        "summary_injection": "pending_assistant_thinking",
+                        "history_context_count": len(history_context),
                         **(reset_info or {}),
                     }
                     context_reset_events.append(reset_event)
@@ -906,8 +1126,13 @@ class MultiTurnReactAgent(FnCallAgent):
                         >= self.context_total_token_limit
                     ):
                         termination = "total_token_limit_reached"
-                        prediction = summary_text or self._latest_assistant_content(
-                            request_messages + [assistant_message]
+                        pre_summary_messages = (
+                            history_context[-1]
+                            if history_context
+                            else request_messages + [assistant_message]
+                        )
+                        prediction = self._latest_assistant_content(
+                            pre_summary_messages
                         )
                         return finalize_result(prediction, termination)
                     continue
@@ -941,7 +1166,7 @@ class MultiTurnReactAgent(FnCallAgent):
                     cumulative_token_usage,
                     self._get_call_usage(truncated_request_messages, assistant_message),
                 )
-                prediction = messages[-1]["content"]
+                prediction = strip_think_blocks(messages[-1].get("content") or "")
                 termination = "token_limit_reached"
                 self._emit_progress(
                     progress_callback,
@@ -961,7 +1186,9 @@ class MultiTurnReactAgent(FnCallAgent):
                 )
                 return finalize_result(prediction, termination)
 
-        prediction = self._latest_assistant_content(messages) or messages[-1].get("content", "")
+        prediction = self._latest_assistant_content(messages) or strip_think_blocks(
+            messages[-1].get("content", "")
+        )
         if termination != "no_tool_call":
             if num_llm_calls_available <= 0:
                 termination = "exceed_llm_calls"
