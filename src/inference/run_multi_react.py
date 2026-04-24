@@ -101,16 +101,34 @@ if __name__ == "__main__":
         exit(1)
 
     model_name = os.path.basename(model.rstrip('/'))
-    
+
+    context_strategy = os.getenv("CONTEXT_MANAGEMENT_STRATEGY", "none")
+    context_reset_threshold = os.getenv("CONTEXT_RESET_THRESHOLD", "0.3")
+    context_summary_trigger_tokens = os.getenv(
+        "CONTEXT_SUMMARY_TRIGGER_TOKENS", "32768"
+    )
+    context_total_token_limit = os.getenv("CONTEXT_TOTAL_TOKEN_LIMIT", "1000000")
+    max_llm_call_per_run = os.getenv("MAX_LLM_CALL_PER_RUN", "100")
+    output_tag = f"ctx-{sanitize_tag_value(context_strategy)}"
+    if context_strategy == "summary":
+        output_tag += (
+            f"_sumctx-{sanitize_tag_value(context_summary_trigger_tokens)}"
+            f"_tot-{sanitize_tag_value(context_total_token_limit)}"
+        )
+    else:
+        output_tag += f"_thr-{sanitize_tag_value(context_reset_threshold)}"
+    output_tag += f"_turns-{sanitize_tag_value(max_llm_call_per_run)}"
+
     model_dir = os.path.join(output_base, f"{model_name}")
-    dataset_dir = os.path.join(model_dir, args.dataset)
+    dataset_base_dir = os.path.join(model_dir, args.dataset)
+    dataset_dir = os.path.join(dataset_base_dir, output_tag)
     running_dir = os.path.join(dataset_dir, "running")
     finished_dir = os.path.join(dataset_dir, "finished")
- 
+
     os.makedirs(dataset_dir, exist_ok=True)
     os.makedirs(running_dir, exist_ok=True)
     os.makedirs(finished_dir, exist_ok=True)
-    
+
     print(f"Model name: {model_name}")
     print(f"Data set name: {args.dataset}")
     print(f"Output directory: {dataset_dir}")
@@ -119,14 +137,6 @@ if __name__ == "__main__":
     print(f"Auto judge enabled: {args.auto_judge}")
     if args.auto_judge:
         print(f"Judge engine: {args.judge_engine}")
-    context_strategy = os.getenv("CONTEXT_MANAGEMENT_STRATEGY", "none")
-    context_reset_threshold = os.getenv("CONTEXT_RESET_THRESHOLD", "0.3")
-    max_llm_call_per_run = os.getenv("MAX_LLM_CALL_PER_RUN", "100")
-    output_tag = (
-        f"ctx-{sanitize_tag_value(context_strategy)}"
-        f"_thr-{sanitize_tag_value(context_reset_threshold)}"
-        f"_turns-{sanitize_tag_value(max_llm_call_per_run)}"
-    )
     print(f"Output tag: {output_tag}")
 
     data_filepath = f"eval_data/{args.dataset}.jsonl"
@@ -168,13 +178,13 @@ if __name__ == "__main__":
         output_files = {
             i: os.path.join(
                 dataset_dir,
-                f"iter{i}_{output_tag}_split{worker_split}of{total_splits}.jsonl"
+                f"iter{i}_split{worker_split}of{total_splits}.jsonl"
             )
             for i in range(1, roll_out_count + 1)
         }
     else:
         output_files = {
-            i: os.path.join(dataset_dir, f"iter{i}_{output_tag}.jsonl")
+            i: os.path.join(dataset_dir, f"iter{i}.jsonl")
             for i in range(1, roll_out_count + 1)
         }
     

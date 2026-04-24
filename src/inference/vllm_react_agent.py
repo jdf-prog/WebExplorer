@@ -66,6 +66,12 @@ class MultiTurnReactAgent(FnCallAgent):
             "CONTEXT_MANAGEMENT_STRATEGY", "none"
         ).strip().lower()
         self.context_reset_threshold = float(os.getenv("CONTEXT_RESET_THRESHOLD", "0.3"))
+        self.context_summary_trigger_tokens = int(
+            os.getenv("CONTEXT_SUMMARY_TRIGGER_TOKENS", "32768")
+        )
+        self.context_total_token_limit = int(
+            os.getenv("CONTEXT_TOTAL_TOKEN_LIMIT", "1000000")
+        )
         self.tokenizer = None
         self._tokenizer_initialized = False
         self._get_tokenizer()
@@ -171,7 +177,7 @@ class MultiTurnReactAgent(FnCallAgent):
         if not usage:
             return None, None
 
-        for key in ("total_tokens", "prompt_tokens"):
+        for key in ("prompt_tokens", "total_tokens"):
             value = usage.get(key)
             if value is None:
                 continue
@@ -189,6 +195,140 @@ class MultiTurnReactAgent(FnCallAgent):
 
         token_count = self.count_tokens(messages)
         return token_count, "local_count_tokens", usage
+
+    def _count_text_tokens(self, text: str, model: str = "gpt-4o") -> int:
+        if not text:
+            return 0
+
+        tokenizer = self._get_tokenizer()
+        if tokenizer is not None:
+            try:
+                return len(tokenizer.encode(text))
+            except Exception:
+                pass
+
+        encoding = tiktoken.encoding_for_model(model)
+        return len(encoding.encode(text))
+
+    def _estimate_completion_tokens(self, assistant_message: Dict) -> int:
+        total = 0
+        total += self._count_text_tokens(assistant_message.get("content") or "")
+        total += self._count_text_tokens(
+            assistant_message.get("reasoning_content") or ""
+        )
+
+        tool_calls = assistant_message.get("tool_calls") or []
+        if tool_calls:
+            total += self._count_text_tokens(
+                json.dumps(tool_calls, ensure_ascii=False)
+            )
+
+        return total
+
+    def _get_call_usage(
+        self, request_messages: List[Dict], assistant_message: Dict
+    ) -> Dict:
+        usage = self._normalize_usage(assistant_message.get("_usage"))
+        if usage:
+            return usage
+
+        prompt_tokens = self.count_tokens(request_messages)
+        completion_tokens = self._estimate_completion_tokens(assistant_message)
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "estimated": True,
+        }
+
+    def _accumulate_usage(self, cumulative_usage: Dict, usage: Optional[Dict]) -> None:
+        if not usage:
+            return
+
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = usage.get(key)
+            if value is None:
+                continue
+            try:
+                cumulative_usage[key] += int(value)
+            except (TypeError, ValueError):
+                continue
+
+        if usage.get("estimated"):
+            cumulative_usage["estimated_calls"] += 1
+
+    def _make_context_management_stats(
+        self, context_events: List[Dict], cumulative_usage: Dict
+    ) -> Dict:
+        discard_all_count = sum(
+            1 for event in context_events if event.get("strategy") == "discard_all"
+        )
+        summary_count = sum(
+            1 for event in context_events if event.get("strategy") == "summary"
+        )
+        return {
+            "context_management_count": len(context_events),
+            "discard_all_count": discard_all_count,
+            "summary_count": summary_count,
+            "context_reset_events": context_events,
+            "cumulative_token_usage": copy.deepcopy(cumulative_usage),
+            "context_total_token_limit": self.context_total_token_limit,
+            "context_summary_trigger_tokens": self.context_summary_trigger_tokens,
+        }
+
+    def _latest_assistant_content(self, messages: List[Dict]) -> str:
+        for message in reversed(messages):
+            if message.get("role") == "assistant" and message.get("content"):
+                return message["content"]
+        return ""
+
+    def _build_summary_request_messages(
+        self, messages: List[Dict], question: str
+    ) -> List[Dict]:
+        stripped_messages = self._strip_internal_message_fields(messages)
+        transcript = json.dumps(stripped_messages, ensure_ascii=False)
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You summarize a web research agent's prior interaction so it can "
+                    "continue later with less context. Preserve established facts, "
+                    "important evidence, URLs or source names when available, tool "
+                    "results worth remembering, failed paths, remaining uncertainties, "
+                    "and the current best candidate answer. Do not invent facts."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Original question:\n{question}\n\n"
+                    "Conversation history to summarize:\n"
+                    f"{transcript}\n\n"
+                    "Write a compact continuation summary with these sections:\n"
+                    "1. Facts established\n"
+                    "2. Evidence and sources\n"
+                    "3. Open questions\n"
+                    "4. Current plan\n"
+                    "5. Best current answer candidate"
+                ),
+            },
+        ]
+
+    def _build_messages_from_summary(
+        self, system_prompt: str, question: str, summary_text: str
+    ) -> List[Dict]:
+        return [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"{question}\n\n"
+                    "Context summary from previous turns. Treat this as authoritative "
+                    "memory of prior work and continue from here without restarting:\n\n"
+                    f"{summary_text}"
+                ),
+            },
+        ]
 
     def _prepare_messages_for_api(self, messages: List[Dict]) -> List[Dict]:
         api_messages = self._strip_internal_message_fields(messages)
@@ -306,7 +446,9 @@ class MultiTurnReactAgent(FnCallAgent):
 
         progress_callback(payload, final=final)
 
-    def call_server(self, msgs, planning_port, use_tools=True, max_tries=10):
+    def call_server(
+        self, msgs, planning_port, use_tools=True, max_tries=10, max_tokens=10000
+    ):
         openai_api_key = "EMPTY"
         openai_api_base = f"http://127.0.0.1:{planning_port}/v1"
 
@@ -329,7 +471,7 @@ class MultiTurnReactAgent(FnCallAgent):
                     "temperature": self.llm_generate_cfg.get("temperature", 0.6),
                     "top_p": self.llm_generate_cfg.get("top_p", 0.95),
                     "logprobs": True,
-                    "max_tokens": 10000,
+                    "max_tokens": max_tokens,
                 }
                 top_k = self.llm_generate_cfg.get("top_k")
                 if top_k is not None:
@@ -424,11 +566,16 @@ class MultiTurnReactAgent(FnCallAgent):
         return len(encoding.encode(json.dumps(messages, ensure_ascii=False)))
 
     def maybe_reset_context(self, messages, question, usage: Optional[Dict] = None):
-        if self.context_management_strategy != "discard_all":
-            return messages, False, None
+        if self.context_management_strategy not in {"discard_all", "summary"}:
+            return messages, None, None
 
-        max_input_tokens = self.llm_generate_cfg.get("max_input_tokens", 320000)
-        reset_threshold_tokens = int(max_input_tokens * self.context_reset_threshold)
+        if self.context_management_strategy == "discard_all":
+            max_input_tokens = self.llm_generate_cfg.get("max_input_tokens", 320000)
+            reset_threshold_tokens = int(max_input_tokens * self.context_reset_threshold)
+        else:
+            max_input_tokens = None
+            reset_threshold_tokens = self.context_summary_trigger_tokens
+
         token_count, token_count_source, token_usage = self._get_context_token_count(
             messages,
             usage=usage,
@@ -439,8 +586,9 @@ class MultiTurnReactAgent(FnCallAgent):
             "token_count_source": token_count_source,
             "threshold": reset_threshold_tokens,
             "max_input_tokens": max_input_tokens,
-            "threshold_ratio": self.context_reset_threshold,
         }
+        if self.context_management_strategy == "discard_all":
+            reset_info["threshold_ratio"] = self.context_reset_threshold
         if token_usage:
             reset_info["usage"] = copy.deepcopy(token_usage)
 
@@ -452,14 +600,17 @@ class MultiTurnReactAgent(FnCallAgent):
         )
 
         if token_count > reset_threshold_tokens:
+            action = self.context_management_strategy
             print(
-                f"context management: resetting conversation history because "
+                f"context management: action={action} because "
                 f"{token_count} > {reset_threshold_tokens}",
                 flush=True,
             )
-            return [{"role": "user", "content": question}], True, reset_info
+            if action == "discard_all":
+                return [{"role": "user", "content": question}], action, reset_info
+            return messages, action, reset_info
 
-        return messages, False, reset_info
+        return messages, None, reset_info
 
     def _run(
         self,
@@ -496,6 +647,12 @@ class MultiTurnReactAgent(FnCallAgent):
         round = 0
         termination = "unknown"
         context_reset_events = []
+        cumulative_token_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "estimated_calls": 0,
+        }
 
         def finalize_result(prediction: str, termination_reason: str):
             result = {
@@ -506,9 +663,12 @@ class MultiTurnReactAgent(FnCallAgent):
                 "log": messages,
                 "prediction": prediction,
                 "termination": termination_reason,
-                "discard_all_count": len(context_reset_events),
-                "context_reset_events": context_reset_events,
             }
+            result.update(
+                self._make_context_management_stats(
+                    context_reset_events, cumulative_token_usage
+                )
+            )
             result.update(task_metadata)
 
             if auto_judge and answer:
@@ -542,7 +702,9 @@ class MultiTurnReactAgent(FnCallAgent):
                 extra_payload={
                     **task_metadata,
                     "auto_judge": result.get("auto_judge"),
-                    "context_reset_events": context_reset_events,
+                    **self._make_context_management_stats(
+                        context_reset_events, cumulative_token_usage
+                    ),
                 },
                 final=True,
             )
@@ -568,6 +730,7 @@ class MultiTurnReactAgent(FnCallAgent):
 
             round += 1
             num_llm_calls_available -= 1
+            request_messages = copy.deepcopy(messages)
             assistant_message = self.call_server(messages, planning_port, use_tools=True)
             print(f"Round {round}: {assistant_message}")
             messages.append(assistant_message)
@@ -577,7 +740,10 @@ class MultiTurnReactAgent(FnCallAgent):
             if has_tool_call:
                 tool_messages = self._execute_tool_calls(tool_calls)
                 messages.extend(tool_messages)
-            latest_usage = assistant_message.get("_usage")
+
+            request_usage = self._get_call_usage(request_messages, assistant_message)
+            self._accumulate_usage(cumulative_token_usage, request_usage)
+            latest_usage = request_usage
 
             self._emit_progress(
                 progress_callback,
@@ -593,6 +759,7 @@ class MultiTurnReactAgent(FnCallAgent):
                     **task_metadata,
                     "num_llm_calls_available": num_llm_calls_available,
                     "has_tool_call": has_tool_call,
+                    "cumulative_token_usage": cumulative_token_usage,
                 },
                 final=False,
             )
@@ -601,14 +768,28 @@ class MultiTurnReactAgent(FnCallAgent):
                 termination = "no_tool_call"
                 break
 
+            if (
+                self.context_management_strategy == "summary"
+                and cumulative_token_usage["total_tokens"]
+                >= self.context_total_token_limit
+            ):
+                termination = "total_token_limit_reached"
+                prediction = self._latest_assistant_content(messages)
+                return finalize_result(prediction, termination)
+
             if num_llm_calls_available <= 0:
                 messages.append({"role": "user", "content": FINAL_MESSAGE})
+                final_request_messages = copy.deepcopy(messages)
                 assistant_message = self.call_server(
                     messages,
                     planning_port,
                     use_tools=False,
                 )
                 messages.append(assistant_message)
+                self._accumulate_usage(
+                    cumulative_token_usage,
+                    self._get_call_usage(final_request_messages, assistant_message),
+                )
                 prediction = messages[-1]["content"]
                 termination = "exceed_llm_calls"
                 self._emit_progress(
@@ -621,18 +802,21 @@ class MultiTurnReactAgent(FnCallAgent):
                     status="running",
                     prediction=prediction,
                     termination=termination,
-                    extra_payload=task_metadata,
+                    extra_payload={
+                        **task_metadata,
+                        "cumulative_token_usage": cumulative_token_usage,
+                    },
                     final=False,
                 )
                 return finalize_result(prediction, termination)
 
             messages_before_reset = len(messages)
-            messages, context_reset, reset_info = self.maybe_reset_context(
+            messages, context_action, reset_info = self.maybe_reset_context(
                 messages,
                 question,
                 usage=latest_usage,
             )
-            if context_reset:
+            if context_action == "discard_all":
                 reset_event = {
                     "round": round,
                     "messages_before_reset": messages_before_reset,
@@ -655,10 +839,78 @@ class MultiTurnReactAgent(FnCallAgent):
                         **task_metadata,
                         "context_reset_events": context_reset_events,
                         "context_reset_event": reset_event,
+                        "cumulative_token_usage": cumulative_token_usage,
                     },
                     final=False,
                 )
                 continue
+            if context_action == "summary":
+                if num_llm_calls_available <= 0:
+                    print(
+                        "context management: skipping summary because there is not "
+                        "enough remaining LLM-call budget",
+                        flush=True,
+                    )
+                else:
+                    summary_request_messages = self._build_summary_request_messages(
+                        messages,
+                        question,
+                    )
+                    summary_message = self.call_server(
+                        summary_request_messages,
+                        planning_port,
+                        use_tools=False,
+                        max_tokens=2048,
+                    )
+                    summary_usage = self._get_call_usage(
+                        summary_request_messages, summary_message
+                    )
+                    self._accumulate_usage(cumulative_token_usage, summary_usage)
+                    summary_text = (summary_message.get("content") or "").strip()
+                    messages = self._build_messages_from_summary(
+                        system_prompt,
+                        question,
+                        summary_text,
+                    )
+                    reset_event = {
+                        "round": round,
+                        "strategy": "summary",
+                        "messages_before_reset": messages_before_reset,
+                        "messages_after_reset": len(messages),
+                        "num_llm_calls_available": num_llm_calls_available,
+                        "summary_text": summary_text,
+                        "summary_usage": summary_usage,
+                        **(reset_info or {}),
+                    }
+                    context_reset_events.append(reset_event)
+                    self._emit_progress(
+                        progress_callback,
+                        question=question,
+                        answer=answer,
+                        messages=messages,
+                        round_idx=round,
+                        planning_port=planning_port,
+                        status="running",
+                        prediction=assistant_message.get("content"),
+                        termination="context_summary",
+                        extra_payload={
+                            **task_metadata,
+                            "context_reset_events": context_reset_events,
+                            "context_reset_event": reset_event,
+                            "cumulative_token_usage": cumulative_token_usage,
+                        },
+                        final=False,
+                    )
+                    if (
+                        cumulative_token_usage["total_tokens"]
+                        >= self.context_total_token_limit
+                    ):
+                        termination = "total_token_limit_reached"
+                        prediction = summary_text or self._latest_assistant_content(
+                            request_messages + [assistant_message]
+                        )
+                        return finalize_result(prediction, termination)
+                    continue
 
             max_tokens = 108 * 1024
             if reset_info and reset_info.get("token_count") is not None:
@@ -678,12 +930,17 @@ class MultiTurnReactAgent(FnCallAgent):
                 print(f"Token quantity exceeds the limit: {token_count} > {max_tokens}")
 
                 messages.append({"role": "user", "content": TRUNCATED_MESSAGE + FINAL_MESSAGE})
+                truncated_request_messages = copy.deepcopy(messages)
                 assistant_message = self.call_server(
                     messages,
                     planning_port,
                     use_tools=False,
                 )
                 messages.append(assistant_message)
+                self._accumulate_usage(
+                    cumulative_token_usage,
+                    self._get_call_usage(truncated_request_messages, assistant_message),
+                )
                 prediction = messages[-1]["content"]
                 termination = "token_limit_reached"
                 self._emit_progress(
@@ -696,12 +953,15 @@ class MultiTurnReactAgent(FnCallAgent):
                     status="running",
                     prediction=prediction,
                     termination=termination,
-                    extra_payload=task_metadata,
+                    extra_payload={
+                        **task_metadata,
+                        "cumulative_token_usage": cumulative_token_usage,
+                    },
                     final=False,
                 )
                 return finalize_result(prediction, termination)
 
-        prediction = messages[-1]["content"]
+        prediction = self._latest_assistant_content(messages) or messages[-1].get("content", "")
         if termination != "no_tool_call":
             if num_llm_calls_available <= 0:
                 termination = "exceed_llm_calls"
