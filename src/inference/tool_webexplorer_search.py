@@ -92,19 +92,19 @@ def google_search_with_serp(query: str, topk: int = 10, max_retry: int = 3) -> s
 @register_tool("search", allow_overwrite=True)
 class WebExplorerSearch(BaseTool):
     name = "search"
-    description = "Web search tool that performs batched web searches: supply an array 'queries'; the tool retrieves search results for each query."
+    description = "Web search in parallel. The parameter is a list of queries. The queries will be sent to a search engine. You will get the brief search results with (title, url, snippet)s for each query."
     parameters = {
-        "type": "object",
         "properties": {
             "queries": {
-                "type": "array",
+                "description": "The queries. Google advanced search operators are supported.",
                 "items": {
                     "type": "string"
                 },
-                "description": "Array of query strings. The queries will be sent to search engine. You will get the brief search results with (title, url, snippet)s for each query."
+                "type": "array"
             },
         },
         "required": ["queries"],
+        "type": "object",
     }
 
     def __init__(self, cfg: Optional[dict] = None):

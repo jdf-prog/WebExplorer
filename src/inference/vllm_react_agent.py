@@ -28,6 +28,7 @@ from tool_webexplorer_browse import *
 from tool_webexplorer_search import *
 
 MAX_LLM_CALL_PER_RUN = int(os.getenv("MAX_LLM_CALL_PER_RUN", 100))
+MAX_TOKENS_SAFETY_MARGIN = int(os.getenv("MAX_TOKENS_SAFETY_MARGIN", "1024"))
 
 TRUNCATED_MESSAGE = """
 --- Maximum Length Limit Reached ---
@@ -64,6 +65,86 @@ def strip_think_blocks(text: Optional[str]) -> str:
     return cleaned.strip()
 
 
+def normalize_context_management_strategy(strategy: str) -> str:
+    normalized = (strategy or "none").strip().lower().replace("-", "_")
+    if normalized in {"discard", "discard_all"}:
+        return "discard_all"
+    if normalized in {
+        "fold_tool",
+        "fold_tools",
+        "fold_tool_call",
+        "fold_tool_calls",
+        "fold_tool_message",
+        "fold_tool_messages",
+    }:
+        return "fold_tool"
+    if normalized == "summary":
+        return "summary"
+    return "none"
+
+
+class ToolMessageContextRewriter:
+    def __init__(self, tokenizer, max_context_length: int, target_context_length: int):
+        self.tokenizer = tokenizer
+        self.max_context_length = max_context_length
+        self.target_context_length = target_context_length
+        self.fold_text = "Content folded due to space limitation"
+        self.mask_token_length = self._encode_len(self.fold_text)
+
+    def _encode_len(self, text: str) -> int:
+        if self.tokenizer is not None:
+            return len(self.tokenizer.encode(text))
+        return len(tiktoken.get_encoding("cl100k_base").encode(text))
+
+    def _get_msg_length(self, msg: Dict) -> int:
+        if msg.get("role") == "assistant":
+            content = msg.get("reasoning_content") or msg.get("content") or ""
+        else:
+            content = msg.get("content") or ""
+        return self._encode_len(content)
+
+    def process(self, messages: List[Dict]) -> List[Dict]:
+        total_tool_tokens = 0
+        msg_lengths = {}
+        tool_indices = []
+
+        for idx, msg in enumerate(messages):
+            if msg.get("role") == "tool":
+                length = self._get_msg_length(msg)
+                msg_lengths[idx] = length
+                total_tool_tokens += length
+                tool_indices.append(idx)
+
+        if total_tool_tokens <= self.max_context_length:
+            return copy.deepcopy(messages)
+
+        processed_msgs = copy.deepcopy(messages)
+        current_tool_tokens = total_tool_tokens
+        masked_count = 0
+        total_tools = len(tool_indices)
+
+        for idx in tool_indices:
+            remaining_tools = total_tools - masked_count
+            if remaining_tools <= 2:
+                break
+
+            if processed_msgs[idx].get("content") == self.fold_text:
+                masked_count += 1
+                continue
+
+            original_len = msg_lengths[idx]
+            saved = original_len - self.mask_token_length
+            if saved > 0:
+                processed_msgs[idx]["content"] = self.fold_text
+                current_tool_tokens -= saved
+                masked_count += 1
+
+            if current_tool_tokens <= self.target_context_length:
+                break
+
+        return processed_msgs
+
+
 class MultiTurnReactAgent(FnCallAgent):
     def __init__(
         self,
@@ -73,9 +154,9 @@ class MultiTurnReactAgent(FnCallAgent):
     ):
         self.llm_generate_cfg = llm["generate_cfg"]
         self.llm_local_path = self._resolve_model_path(llm["model"])
-        self.context_management_strategy = os.getenv(
-            "CONTEXT_MANAGEMENT_STRATEGY", "none"
-        ).strip().lower()
+        self.context_management_strategy = normalize_context_management_strategy(
+            os.getenv("CONTEXT_MANAGEMENT_STRATEGY", "none")
+        )
         self.context_reset_threshold = float(os.getenv("CONTEXT_RESET_THRESHOLD", "0.3"))
         self.context_summary_trigger_tokens = int(
             os.getenv("CONTEXT_SUMMARY_TRIGGER_TOKENS", "32768")
@@ -83,13 +164,55 @@ class MultiTurnReactAgent(FnCallAgent):
         self.context_total_token_limit = int(
             os.getenv("CONTEXT_TOTAL_TOKEN_LIMIT", "1000000")
         )
-        self.context_summary_max_tokens = int(
-            os.getenv("CONTEXT_SUMMARY_MAX_TOKENS", "4096")
-        )
         self.tokenizer = None
         self._tokenizer_initialized = False
         self._get_tokenizer()
+        self.tool_instances = self._resolve_tool_instances(function_list)
+        self.tool_map = {tool.name: tool for tool in self.tool_instances}
         self.tool_schemas = self._build_tool_schemas()
+        self.tool_context_rewriter = ToolMessageContextRewriter(
+            tokenizer=self.tokenizer,
+            max_context_length=int(
+                os.getenv(
+                    "TOOL_CONTEXT_MAX",
+                    os.getenv("QWEN_TOOL_CONTEXT_MAX", "32000"),
+                )
+            ),
+            target_context_length=int(
+                os.getenv(
+                    "TOOL_CONTEXT_TARGET",
+                    os.getenv("QWEN_TOOL_CONTEXT_TARGET", "5000"),
+                )
+            ),
+        )
+
+    def _available_tool_instances(self) -> List[BaseTool]:
+        return [
+            WebExplorerBrowse(),
+            WebExplorerSearch(),
+        ]
+
+    def _resolve_tool_instances(
+        self, function_list: Optional[List[Union[str, Dict, BaseTool]]]
+    ) -> List[BaseTool]:
+        available_tools = self._available_tool_instances()
+        if not function_list:
+            return available_tools
+
+        tool_map = {tool.name: tool for tool in available_tools}
+        selected_tools: List[BaseTool] = []
+        for tool_spec in function_list:
+            if isinstance(tool_spec, BaseTool):
+                selected_tools.append(tool_spec)
+                continue
+            if isinstance(tool_spec, dict):
+                tool_name = tool_spec.get("name")
+            else:
+                tool_name = str(tool_spec)
+            if tool_name in tool_map:
+                selected_tools.append(tool_map[tool_name])
+
+        return selected_tools or available_tools
 
     def _resolve_model_path(self, model_name_or_path: str) -> str:
         candidate = Path(model_name_or_path)
@@ -105,7 +228,7 @@ class MultiTurnReactAgent(FnCallAgent):
 
     def _build_tool_schemas(self) -> List[Dict]:
         tool_schemas: List[Dict] = []
-        for tool in TOOL_CLASS:
+        for tool in self.tool_instances:
             tool_schemas.append(
                 {
                     "type": "function",
@@ -117,6 +240,11 @@ class MultiTurnReactAgent(FnCallAgent):
                 }
             )
         return tool_schemas
+
+    def _prepare_inference_messages(self, messages: List[Dict]) -> List[Dict]:
+        if self.context_management_strategy != "fold_tool":
+            return messages
+        return self.tool_context_rewriter.process(messages)
 
     def _get_tokenizer(self):
         if self._tokenizer_initialized:
@@ -264,34 +392,25 @@ class MultiTurnReactAgent(FnCallAgent):
             "estimated": True,
         }
 
-    def _accumulate_usage(self, cumulative_usage: Dict, usage: Optional[Dict]) -> None:
+    def _ensure_message_usage(
+        self, request_messages: List[Dict], assistant_message: Dict
+    ) -> Dict:
+        usage = self._get_call_usage(request_messages, assistant_message)
+        if usage and not assistant_message.get("_usage"):
+            assistant_message["_usage"] = copy.deepcopy(usage)
+        return usage
+
+    def _accumulate_context_reset_usage(
+        self, cumulative_usage: Dict, usage: Optional[Dict]
+    ) -> None:
         if not usage:
             return
 
         prompt_tokens = usage.get("prompt_tokens")
-        completion_tokens = usage.get("completion_tokens")
-        billable_total_tokens = usage.get("total_tokens")
 
         try:
             if prompt_tokens is not None:
-                cumulative_usage["prompt_tokens"] += int(prompt_tokens)
-        except (TypeError, ValueError):
-            pass
-
-        try:
-            if completion_tokens is not None:
-                completion_value = int(completion_tokens)
-                cumulative_usage["completion_tokens"] += completion_value
-                # For eval, `total_tokens` tracks generated tokens only.
-                cumulative_usage["total_tokens"] += completion_value
-        except (TypeError, ValueError):
-            pass
-
-        try:
-            if billable_total_tokens is not None:
-                cumulative_usage["billable_total_tokens"] += int(
-                    billable_total_tokens
-                )
+                cumulative_usage["context_reset_prompt_tokens"] += int(prompt_tokens)
         except (TypeError, ValueError):
             pass
 
@@ -313,10 +432,9 @@ class MultiTurnReactAgent(FnCallAgent):
             "summary_count": summary_count,
             "context_reset_events": context_events,
             "cumulative_token_usage": copy.deepcopy(cumulative_usage),
-            "cumulative_token_usage_metric": "completion_tokens",
+            "cumulative_token_usage_metric": "context_reset_prompt_tokens",
             "context_total_token_limit": self.context_total_token_limit,
             "context_summary_trigger_tokens": self.context_summary_trigger_tokens,
-            "context_summary_max_tokens": self.context_summary_max_tokens,
         }
 
     def _latest_assistant_content(self, messages: List[Dict]) -> str:
@@ -636,6 +754,7 @@ Directly output the summary content without any other text."""
             "status": status,
             "question": question,
             "answer": answer,
+            "tools": copy.deepcopy(self.tool_schemas),
             "messages": copy.deepcopy(messages),
             "log": copy.deepcopy(messages),
             "prediction": prediction,
@@ -649,9 +768,7 @@ Directly output the summary content without any other text."""
 
         progress_callback(payload, final=final)
 
-    def call_server(
-        self, msgs, planning_port, use_tools=True, max_tries=10, max_tokens=10000
-    ):
+    def call_server(self, msgs, planning_port, use_tools=True, max_tries=10):
         openai_api_key = "EMPTY"
         openai_api_base = f"http://127.0.0.1:{planning_port}/v1"
 
@@ -662,6 +779,34 @@ Directly output the summary content without any other text."""
         )
 
         base_sleep_time = 1
+        dynamic_max_tokens, prompt_tokens, max_input_tokens = (
+            self._get_dynamic_max_tokens(
+                msgs,
+                use_tools=use_tools,
+            )
+        )
+        remaining_tokens = max_input_tokens - prompt_tokens
+        print(
+            "dynamic max_tokens: "
+            f"{dynamic_max_tokens} "
+            f"(remaining_context_tokens={remaining_tokens}, "
+            f"max_input_tokens={max_input_tokens}, "
+            f"prompt_tokens={prompt_tokens}, "
+            f"safety_margin={MAX_TOKENS_SAFETY_MARGIN})",
+            flush=True,
+        )
+        if dynamic_max_tokens <= 0:
+            return {
+                "role": "assistant",
+                "content": "",
+                "_finish_reason": "input_token_limit_reached",
+                "_usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": 0,
+                    "total_tokens": prompt_tokens,
+                    "estimated": True,
+                },
+            }
 
         for attempt in range(max_tries):
             try:
@@ -674,16 +819,30 @@ Directly output the summary content without any other text."""
                     "temperature": self.llm_generate_cfg.get("temperature", 0.6),
                     "top_p": self.llm_generate_cfg.get("top_p", 0.95),
                     "logprobs": True,
-                    "max_tokens": max_tokens,
+                    "max_tokens": dynamic_max_tokens,
                 }
+                presence_penalty = self.llm_generate_cfg.get("presence_penalty")
+                if presence_penalty is not None:
+                    request_kwargs["presence_penalty"] = presence_penalty
+                extra_body = {}
                 top_k = self.llm_generate_cfg.get("top_k")
+                min_p = self.llm_generate_cfg.get("min_p")
+                repetition_penalty = self.llm_generate_cfg.get("repetition_penalty")
                 if top_k is not None:
-                    request_kwargs["extra_body"] = {"top_k": top_k}
+                    extra_body["top_k"] = top_k
+                if min_p is not None:
+                    extra_body["min_p"] = min_p
+                if repetition_penalty is not None:
+                    extra_body["repetition_penalty"] = repetition_penalty
+                if extra_body:
+                    request_kwargs["extra_body"] = extra_body
                 if use_tools:
                     request_kwargs["tools"] = self.tool_schemas
 
                 chat_response = client.chat.completions.create(**request_kwargs)
-                message = chat_response.choices[0].message
+                choice = chat_response.choices[0]
+                message = choice.message
+                finish_reason = getattr(choice, "finish_reason", None)
                 content = message.content
                 has_tool_calls = bool(getattr(message, "tool_calls", None))
                 usage = self._normalize_usage(getattr(chat_response, "usage", None))
@@ -695,6 +854,8 @@ Directly output the summary content without any other text."""
                     assistant_message = self._normalize_assistant_message(message)
                     if usage:
                         assistant_message["_usage"] = usage
+                    if finish_reason:
+                        assistant_message["_finish_reason"] = finish_reason
                     return assistant_message
 
                 print(f"Warning: Attempt {attempt + 1} received an empty response.")
@@ -738,15 +899,15 @@ Directly output the summary content without any other text."""
                 result["auto_judge"] = {"error": str(e), "score": 0}
         return result
 
-    def count_tokens(self, messages, model="gpt-4o"):
+    def count_tokens(self, messages, model="gpt-4o", include_tools=True):
         tokenizer = self._get_tokenizer()
         if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
             try:
                 tokenized = tokenizer.apply_chat_template(
                     self._prepare_messages_for_template(messages),
-                    tools=self.tool_schemas,
+                    tools=self.tool_schemas if include_tools else None,
                     tokenize=True,
-                    add_generation_prompt=False,
+                    add_generation_prompt=True,
                 )
                 if hasattr(tokenized, "keys") and "input_ids" in tokenized:
                     input_ids = tokenized["input_ids"]
@@ -765,8 +926,26 @@ Directly output the summary content without any other text."""
             except Exception as e:
                 print(f"Warning: tokenizer.apply_chat_template failed, fallback to tiktoken: {e}")
 
+        token_payload = {
+            "messages": self._prepare_messages_for_api(messages),
+        }
+        if include_tools:
+            token_payload["tools"] = self.tool_schemas
+
         encoding = tiktoken.encoding_for_model(model)
-        return len(encoding.encode(json.dumps(messages, ensure_ascii=False)))
+        return len(encoding.encode(json.dumps(token_payload, ensure_ascii=False)))
+
+    def _get_dynamic_max_tokens(
+        self,
+        messages: List[Dict],
+        use_tools: bool,
+    ):
+        prompt_tokens = self.count_tokens(messages, include_tools=use_tools)
+        max_input_tokens = int(self.llm_generate_cfg.get("max_input_tokens", 196608))
+        remaining_tokens = (
+            max_input_tokens - prompt_tokens - MAX_TOKENS_SAFETY_MARGIN
+        )
+        return remaining_tokens, prompt_tokens, max_input_tokens
 
     def maybe_reset_context(self, messages, question, usage: Optional[Dict] = None):
         if self.context_management_strategy not in {"discard_all", "summary"}:
@@ -835,7 +1014,8 @@ Directly output the summary content without any other text."""
         answer = data["item"]["answer"]
         self.user_prompt = question
         if "minimax-m2.5" in model.lower():
-            system_prompt = MINIMAX_25_SYSTEM_PROMPT
+            # system_prompt = MINIMAX_25_SYSTEM_PROMPT
+            system_prompt = SYSTEM_PROMPT
         elif "minimax-m2.1" in model.lower():
             system_prompt = MINIMAX_21_SYSTEM_PROMPT
         else:
@@ -849,12 +1029,10 @@ Directly output the summary content without any other text."""
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
         round = 0
         termination = "unknown"
+        context_fold_trigger_step = None
         context_reset_events = []
         cumulative_token_usage = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "billable_total_tokens": 0,
+            "context_reset_prompt_tokens": 0,
             "estimated_calls": 0,
         }
         pending_summary_for_thinking = None
@@ -864,11 +1042,13 @@ Directly output the summary content without any other text."""
             result = {
                 "question": question,
                 "answer": answer,
+                "tools": copy.deepcopy(self.tool_schemas),
                 "round": round,
                 "messages": messages,
                 "log": messages,
                 "prediction": prediction,
                 "termination": termination_reason,
+                "context_fold_trigger_step": context_fold_trigger_step,
             }
             result.update(
                 self._make_context_management_stats(
@@ -911,6 +1091,7 @@ Directly output the summary content without any other text."""
                     **self._make_context_management_stats(
                         context_reset_events, cumulative_token_usage
                     ),
+                    "context_fold_trigger_step": context_fold_trigger_step,
                 },
                 final=True,
             )
@@ -944,8 +1125,18 @@ Directly output the summary content without any other text."""
 
             round += 1
             num_llm_calls_available -= 1
-            request_messages = copy.deepcopy(messages)
-            assistant_message = self.call_server(messages, planning_port, use_tools=True)
+            inference_messages = self._prepare_inference_messages(messages)
+            if context_fold_trigger_step is None and inference_messages is not messages:
+                for message in inference_messages:
+                    if message.get("content") == self.tool_context_rewriter.fold_text:
+                        context_fold_trigger_step = round
+                        break
+            request_messages = copy.deepcopy(inference_messages)
+            assistant_message = self.call_server(
+                inference_messages,
+                planning_port,
+                use_tools=True,
+            )
             print(f"Round {round}: {assistant_message}")
             messages.append(assistant_message)
 
@@ -955,9 +1146,11 @@ Directly output the summary content without any other text."""
                 tool_messages = self._execute_tool_calls(tool_calls)
                 messages.extend(tool_messages)
 
-            request_usage = self._get_call_usage(request_messages, assistant_message)
-            self._accumulate_usage(cumulative_token_usage, request_usage)
+            request_usage = self._ensure_message_usage(
+                request_messages, assistant_message
+            )
             latest_usage = request_usage
+            finish_reason = assistant_message.get("_finish_reason")
 
             self._emit_progress(
                 progress_callback,
@@ -973,39 +1166,47 @@ Directly output the summary content without any other text."""
                     **task_metadata,
                     "num_llm_calls_available": num_llm_calls_available,
                     "has_tool_call": has_tool_call,
-                    "cumulative_token_usage": cumulative_token_usage,
+                    "context_fold_trigger_step": context_fold_trigger_step,
                 },
                 final=False,
             )
 
             if not has_tool_call:
-                termination = "no_tool_call"
+                termination = (
+                    "max_tokens_reached"
+                    if finish_reason == "length"
+                    else (
+                        "input_token_limit_reached"
+                        if finish_reason == "input_token_limit_reached"
+                        else "no_tool_call"
+                    )
+                )
                 break
-
-            if (
-                self.context_management_strategy == "summary"
-                and cumulative_token_usage["total_tokens"]
-                >= self.context_total_token_limit
-            ):
-                termination = "total_token_limit_reached"
-                prediction = self._latest_assistant_content(messages)
-                return finalize_result(prediction, termination)
 
             if num_llm_calls_available <= 0:
                 messages.append({"role": "user", "content": FINAL_MESSAGE})
-                final_request_messages = copy.deepcopy(messages)
+                final_inference_messages = self._prepare_inference_messages(messages)
+                final_request_messages = copy.deepcopy(final_inference_messages)
                 assistant_message = self.call_server(
-                    messages,
+                    final_inference_messages,
                     planning_port,
                     use_tools=False,
                 )
                 messages.append(assistant_message)
-                self._accumulate_usage(
-                    cumulative_token_usage,
-                    self._get_call_usage(final_request_messages, assistant_message),
+                self._ensure_message_usage(
+                    final_request_messages, assistant_message
                 )
                 prediction = strip_think_blocks(messages[-1].get("content") or "")
-                termination = "exceed_llm_calls"
+                finish_reason = assistant_message.get("_finish_reason")
+                termination = (
+                    "max_tokens_reached"
+                    if finish_reason == "length"
+                    else (
+                        "input_token_limit_reached"
+                        if finish_reason == "input_token_limit_reached"
+                        else "exceed_llm_calls"
+                    )
+                )
                 self._emit_progress(
                     progress_callback,
                     question=question,
@@ -1019,6 +1220,7 @@ Directly output the summary content without any other text."""
                     extra_payload={
                         **task_metadata,
                         "cumulative_token_usage": cumulative_token_usage,
+                        "context_fold_trigger_step": context_fold_trigger_step,
                     },
                     final=False,
                 )
@@ -1031,6 +1233,10 @@ Directly output the summary content without any other text."""
                 usage=latest_usage,
             )
             if context_action == "discard_all":
+                self._accumulate_context_reset_usage(
+                    cumulative_token_usage,
+                    (reset_info or {}).get("usage"),
+                )
                 reset_event = {
                     "round": round,
                     "messages_before_reset": messages_before_reset,
@@ -1054,6 +1260,7 @@ Directly output the summary content without any other text."""
                         "context_reset_events": context_reset_events,
                         "context_reset_event": reset_event,
                         "cumulative_token_usage": cumulative_token_usage,
+                        "context_fold_trigger_step": context_fold_trigger_step,
                     },
                     final=False,
                 )
@@ -1074,12 +1281,16 @@ Directly output the summary content without any other text."""
                         summary_request_messages,
                         planning_port,
                         use_tools=False,
-                        max_tokens=self.context_summary_max_tokens,
                     )
                     summary_usage = self._get_call_usage(
                         summary_request_messages, summary_message
                     )
-                    self._accumulate_usage(cumulative_token_usage, summary_usage)
+                    if summary_usage and not summary_message.get("_usage"):
+                        summary_message["_usage"] = copy.deepcopy(summary_usage)
+                    self._accumulate_context_reset_usage(
+                        cumulative_token_usage,
+                        (reset_info or {}).get("usage"),
+                    )
                     summary_text = strip_think_blocks(
                         summary_message.get("content") or ""
                     )
@@ -1118,11 +1329,12 @@ Directly output the summary content without any other text."""
                             "context_reset_events": context_reset_events,
                             "context_reset_event": reset_event,
                             "cumulative_token_usage": cumulative_token_usage,
+                            "context_fold_trigger_step": context_fold_trigger_step,
                         },
                         final=False,
                     )
                     if (
-                        cumulative_token_usage["total_tokens"]
+                        cumulative_token_usage["context_reset_prompt_tokens"]
                         >= self.context_total_token_limit
                     ):
                         termination = "total_token_limit_reached"
@@ -1142,9 +1354,10 @@ Directly output the summary content without any other text."""
                 token_count = reset_info["token_count"]
                 token_count_source = reset_info.get("token_count_source")
             else:
+                token_count_messages = self._prepare_inference_messages(messages)
                 token_count, token_count_source, _ = self._get_context_token_count(
-                    messages,
-                    usage=latest_usage,
+                    token_count_messages,
+                    usage=None if token_count_messages is not messages else latest_usage,
                 )
             print(
                 f"round: {round}, token count: {token_count}, "
@@ -1155,19 +1368,28 @@ Directly output the summary content without any other text."""
                 print(f"Token quantity exceeds the limit: {token_count} > {max_tokens}")
 
                 messages.append({"role": "user", "content": TRUNCATED_MESSAGE + FINAL_MESSAGE})
-                truncated_request_messages = copy.deepcopy(messages)
+                truncated_inference_messages = self._prepare_inference_messages(messages)
+                truncated_request_messages = copy.deepcopy(truncated_inference_messages)
                 assistant_message = self.call_server(
-                    messages,
+                    truncated_inference_messages,
                     planning_port,
                     use_tools=False,
                 )
                 messages.append(assistant_message)
-                self._accumulate_usage(
-                    cumulative_token_usage,
-                    self._get_call_usage(truncated_request_messages, assistant_message),
+                self._ensure_message_usage(
+                    truncated_request_messages, assistant_message
                 )
                 prediction = strip_think_blocks(messages[-1].get("content") or "")
-                termination = "token_limit_reached"
+                finish_reason = assistant_message.get("_finish_reason")
+                termination = (
+                    "max_tokens_reached"
+                    if finish_reason == "length"
+                    else (
+                        "input_token_limit_reached"
+                        if finish_reason == "input_token_limit_reached"
+                        else "token_limit_reached"
+                    )
+                )
                 self._emit_progress(
                     progress_callback,
                     question=question,
@@ -1181,6 +1403,7 @@ Directly output the summary content without any other text."""
                     extra_payload={
                         **task_metadata,
                         "cumulative_token_usage": cumulative_token_usage,
+                        "context_fold_trigger_step": context_fold_trigger_step,
                     },
                     final=False,
                 )
@@ -1197,10 +1420,10 @@ Directly output the summary content without any other text."""
         return finalize_result(prediction, termination)
 
     def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs):
-        if tool_name in TOOL_MAP:
+        if tool_name in self.tool_map:
             tool_payload = copy.deepcopy(tool_args)
             tool_payload["params"] = copy.deepcopy(tool_args)
-            raw_result = TOOL_MAP[tool_name].call(tool_payload, **kwargs)
+            raw_result = self.tool_map[tool_name].call(tool_payload, **kwargs)
             result = raw_result
             return result
         return f"Error: Tool {tool_name} not found"

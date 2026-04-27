@@ -8,6 +8,7 @@ from tqdm import tqdm
 import threading
 from datetime import datetime, timezone
 from vllm_react_agent import MultiTurnReactAgent
+from qwen_vllm_agent import QwenVllmReactAgent
 import time
 import math
 import re
@@ -25,6 +26,28 @@ def sanitize_file_stem(value: str) -> str:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_context_management_strategy(strategy: str) -> str:
+    normalized = (strategy or "none").strip().lower().replace("-", "_")
+    if normalized in {"discard", "discard_all"}:
+        return "discard_all"
+    if normalized in {
+        "fold_tool",
+        "fold_tools",
+        "fold_tool_call",
+        "fold_tool_calls",
+        "fold_tool_message",
+        "fold_tool_messages",
+    }:
+        return "fold_tool"
+    if normalized == "summary":
+        return "summary"
+    return "none"
+
+
+def is_qwen_model(model_name: str) -> bool:
+    return "qwen" in os.path.basename(model_name.rstrip("/")).lower()
 
 
 def write_json_atomic(path: str, payload: dict) -> None:
@@ -102,18 +125,27 @@ if __name__ == "__main__":
 
     model_name = os.path.basename(model.rstrip('/'))
 
-    context_strategy = os.getenv("CONTEXT_MANAGEMENT_STRATEGY", "none")
+    context_strategy = normalize_context_management_strategy(
+        os.getenv("CONTEXT_MANAGEMENT_STRATEGY", "none")
+    )
     context_reset_threshold = os.getenv("CONTEXT_RESET_THRESHOLD", "0.3")
     context_summary_trigger_tokens = os.getenv(
         "CONTEXT_SUMMARY_TRIGGER_TOKENS", "32768"
     )
     context_total_token_limit = os.getenv("CONTEXT_TOTAL_TOKEN_LIMIT", "1000000")
+    tool_context_max = os.getenv("TOOL_CONTEXT_MAX", os.getenv("QWEN_TOOL_CONTEXT_MAX", "32000"))
+    tool_context_target = os.getenv("TOOL_CONTEXT_TARGET", os.getenv("QWEN_TOOL_CONTEXT_TARGET", "5000"))
     max_llm_call_per_run = os.getenv("MAX_LLM_CALL_PER_RUN", "100")
     output_tag = f"ctx-{sanitize_tag_value(context_strategy)}"
     if context_strategy == "summary":
         output_tag += (
             f"_sumctx-{sanitize_tag_value(context_summary_trigger_tokens)}"
             f"_tot-{sanitize_tag_value(context_total_token_limit)}"
+        )
+    elif context_strategy == "fold_tool":
+        output_tag += (
+            f"_toolmax-{sanitize_tag_value(tool_context_max)}"
+            f"_tooltarget-{sanitize_tag_value(tool_context_target)}"
         )
     else:
         output_tag += f"_thr-{sanitize_tag_value(context_reset_threshold)}"
@@ -278,14 +310,24 @@ if __name__ == "__main__":
                 'temperature': args.temperature,
                 'top_p': args.top_p,
                 'top_k': int(os.getenv("TOP_K", "40")),
+                'min_p': float(os.getenv("MIN_P", "0.0")),
+                'presence_penalty': float(os.getenv("PRESENCE_PENALTY", "0.0")),
+                'repetition_penalty': float(os.getenv("REPETITION_PENALTY", "1.0")),
             },
             'model_type': 'qwen_dashscope'
         }
 
-        test_agent = MultiTurnReactAgent(
-            llm=llm_cfg,
-            function_list=["search", "browse"]
-        )
+        if is_qwen_model(model):
+            test_agent = QwenVllmReactAgent(
+                llm=llm_cfg,
+                function_list=["code_interpreter", "web_search", "web_extractor"],
+            )
+        else:
+            test_agent = MultiTurnReactAgent(
+                llm=llm_cfg,
+                function_list=["search", "browse"],
+            )
+        tool_schemas = copy.deepcopy(getattr(test_agent, "tool_schemas", []))
 
         write_locks = {i: threading.Lock() for i in range(1, roll_out_count + 1)}
 
@@ -315,6 +357,7 @@ if __name__ == "__main__":
                     result = future.result()
                     result["task_id"] = task_info["task_id"]
                     result["task_index"] = task_info["task_index"]
+                    result.setdefault("tools", tool_schemas)
                     with write_locks[rollout_idx]:
                         with open(output_file, "a", encoding="utf-8") as f:
                             f.write(json.dumps(result, ensure_ascii=False) + "\n")
@@ -325,6 +368,7 @@ if __name__ == "__main__":
                     error_result = {
                         "question": question,
                         "answer": task_info["item"].get("answer", ""),
+                        "tools": tool_schemas,
                         "rollout_idx": rollout_idx,
                         "rollout_id": rollout_idx,
                         "task_id": task_info["task_id"],
@@ -345,6 +389,7 @@ if __name__ == "__main__":
                     error_result = {
                         "question": question,
                         "answer": task_info["item"].get("answer", ""),
+                        "tools": tool_schemas,
                         "rollout_idx": rollout_idx,
                         "rollout_id": rollout_idx,
                         "task_id": task_info["task_id"],

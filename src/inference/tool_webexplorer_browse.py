@@ -3,6 +3,7 @@ import re
 import time
 import random
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Union, Optional
 from qwen_agent.tools.base import BaseTool, register_tool
 from openai import OpenAI
@@ -229,23 +230,59 @@ def get_browse_results(url: str, browse_query: str, read_engine: str = "jina", g
     return output
 
 
+def get_browses_results(urls, browse_query: str, read_engine: str = "jina", generate_engine: str = "deepseekchat", max_retry: int = 3) -> str:
+    """Browse multiple URLs in parallel and format each page answer separately."""
+    futures = []
+    with ThreadPoolExecutor(max_workers=len(urls)) as executor:
+        for i, url in enumerate(urls):
+            futures.append(
+                executor.submit(
+                    lambda j, u: (
+                        j,
+                        get_browse_results(
+                            url=u,
+                            browse_query=browse_query,
+                            read_engine=read_engine,
+                            generate_engine=generate_engine,
+                            max_retry=max_retry,
+                        ),
+                    ),
+                    i,
+                    url,
+                )
+            )
+
+    results = ["" for _ in range(len(urls))]
+    for future in as_completed(futures):
+        i, output_i = future.result()
+        results[i] = output_i
+
+    output = ""
+    for i, result in enumerate(results):
+        output += f"--- answer based on [{urls[i]}] ---\n{result}\n--- end of answer ---\n\n"
+    return output.strip()
+
+
 @register_tool("browse", allow_overwrite=True)
 class WebExplorerBrowse(BaseTool):
     name = "browse"
-    description = "Browse a webpage and extract relevant information based on a specific query."
+    description = "Explore specific information in a list of urls. The parameters are a url list and a query. The urls will be browsed, and each content will be sent to a Large Language Model (LLM) as the based information to answer the query."
     parameters = {
-        "type": "object",
         "properties": {
-            "url": {
-                "type": "string",
-                "description": "The URL of the webpage to browse."
+            "urls": {
+                "description": "The url list.",
+                "items": {
+                    "type": "string"
+                },
+                "type": "array"
             },
             "query": {
-                "type": "string",
-                "description": "The specific query to extract relevant information from the webpage."
+                "description": "The query. A detailed natural language query is recommended.",
+                "type": "string"
             }
         },
-        "required": ["url", "query"]
+        "required": ["urls", "query"],
+        "type": "object"
     }
 
     def __init__(self, cfg: Optional[dict] = None):
@@ -258,13 +295,16 @@ class WebExplorerBrowse(BaseTool):
 
     def call(self, params: Union[str, dict], **kwargs) -> str:
         try:
-            url = params["url"]
+            urls = params.get("urls", params.get("url"))
             query = params["query"]
         except:
-            return "[Browse] Invalid request format: Input must be a JSON object containing 'url' and 'query' fields"
+            return "[Browse] Invalid request format: Input must be a JSON object containing 'urls' and 'query' fields"
 
-        if not url or not isinstance(url, str):
-            return "[Browse] Error: 'url' is missing, empty, or not a string"
+        if isinstance(urls, str):
+            urls = [urls]
+
+        if not urls or not isinstance(urls, list) or not all(isinstance(url, str) and url for url in urls):
+            return "[Browse] Error: 'urls' is missing, empty, or not a list of strings"
         
         if not isinstance(query, str):
             return "[Browse] Error: 'query' is missing or not a string"
@@ -273,8 +313,8 @@ class WebExplorerBrowse(BaseTool):
             query = "Detailed summary of the page."
 
         try:
-            result = get_browse_results(
-                url=url,
+            result = get_browses_results(
+                urls=urls,
                 browse_query=query,
                 read_engine=self.read_engine,
                 generate_engine=self.generate_engine,
