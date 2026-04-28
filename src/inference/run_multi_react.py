@@ -97,6 +97,38 @@ def build_progress_writer(task_info: dict):
     return _write
 
 
+def collect_processed_queries(output_file: str, finished_dir: str, rollout_idx: int) -> set:
+    processed_queries = set()
+    if os.path.exists(output_file):
+        try:
+            with open(output_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                        if "question" in data and "error" not in data:
+                            processed_queries.add(data["question"].strip())
+                    except json.JSONDecodeError:
+                        print(f"Warning: Skipping invalid line in output file: {line.strip()}")
+        except FileNotFoundError:
+            pass
+
+    if os.path.isdir(finished_dir):
+        for filename in os.listdir(finished_dir):
+            if not filename.endswith(f"_iter{rollout_idx}.json"):
+                continue
+            path = os.path.join(finished_dir, filename)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError) as e:
+                print(f"Warning: Skipping invalid finished file {path}: {e}")
+                continue
+            if "question" in data and "error" not in data:
+                processed_queries.add(data["question"].strip())
+
+    return processed_queries
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="")
@@ -224,19 +256,11 @@ if __name__ == "__main__":
 
     for rollout_idx in range(1, roll_out_count + 1):
         output_file = output_files[rollout_idx]
-        processed_queries = set()
-        if os.path.exists(output_file):
-            try:
-                with open(output_file, "r", encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            data = json.loads(line)
-                            if "question" in data and "error" not in data:
-                                processed_queries.add(data["question"].strip())
-                        except json.JSONDecodeError:
-                            print(f"Warning: Skipping invalid line in output file: {line.strip()}")
-            except FileNotFoundError:
-                pass
+        processed_queries = collect_processed_queries(
+            output_file=output_file,
+            finished_dir=finished_dir,
+            rollout_idx=rollout_idx,
+        )
         processed_queries_per_rollout[rollout_idx] = processed_queries
 
     tasks_to_run_all = []

@@ -29,6 +29,9 @@ from tool_webexplorer_search import *
 
 MAX_LLM_CALL_PER_RUN = int(os.getenv("MAX_LLM_CALL_PER_RUN", 100))
 MAX_TOKENS_SAFETY_MARGIN = int(os.getenv("MAX_TOKENS_SAFETY_MARGIN", "1024"))
+DEFAULT_NAM_MAX_MEMORY_SIZE = 32000
+DEFAULT_NAM_TRIGGER_LOW_FRAC = 0.25
+DEFAULT_NAM_TRIGGER_HIGH_FRAC = 0.75
 
 TRUNCATED_MESSAGE = """
 --- Maximum Length Limit Reached ---
@@ -43,6 +46,21 @@ You must offer your final answer now."""
 SYSTEM_PROMPT = "You are a helpful assistant."
 MINIMAX_21_SYSTEM_PROMPT = "You are a helpful assistant. Your name is MiniMax-M2.1 and is built by MiniMax."
 MINIMAX_25_SYSTEM_PROMPT = "You are a helpful assistant. Your name is MiniMax-M2.5 and is built by MiniMax."
+NAM_STAGE1_PROMPT = """You are the context memory controller for an agent.
+
+Your job is to decide whether the current conversation history should be summarized before the next assistant response.
+
+The agent has a bounded active context memory. If the context is getting large, contains many tool results, repeated search/browse outputs, or older intermediate reasoning that can be compressed while preserving task-critical facts, answer YES. If the context is still compact and preserving the exact raw history is more useful than summarizing, answer NO.
+
+Consider:
+- Current token count
+- Low and high trigger thresholds
+- Number of messages
+- Whether the recent history contains large tool observations
+- Whether important facts, constraints, URLs, search results, and pending subtasks can be safely captured in a summary
+- Whether continuing without summarization risks exceeding context memory soon
+
+Output exactly one word after any thinking: YES or NO."""
 
 TOOL_CLASS = [
     WebExplorerBrowse(),
@@ -81,6 +99,13 @@ def normalize_context_management_strategy(strategy: str) -> str:
     if normalized == "summary":
         return "summary"
     return "none"
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 class ToolMessageContextRewriter:
@@ -154,13 +179,31 @@ class MultiTurnReactAgent(FnCallAgent):
     ):
         self.llm_generate_cfg = llm["generate_cfg"]
         self.llm_local_path = self._resolve_model_path(llm["model"])
+        model_basename = os.path.basename(str(llm["model"]).rstrip("/")).lower()
         self.context_management_strategy = normalize_context_management_strategy(
             os.getenv("CONTEXT_MANAGEMENT_STRATEGY", "none")
         )
         self.context_reset_threshold = float(os.getenv("CONTEXT_RESET_THRESHOLD", "0.3"))
-        self.context_summary_trigger_tokens = int(
-            os.getenv("CONTEXT_SUMMARY_TRIGGER_TOKENS", "32768")
+        self.nam_max_memory_size = int(
+            os.getenv("NAM_MAX_MEMORY_SIZE", str(DEFAULT_NAM_MAX_MEMORY_SIZE))
         )
+        self.nam_trigger_low_frac = float(
+            os.getenv("NAM_TRIGGER_LOW_FRAC", str(DEFAULT_NAM_TRIGGER_LOW_FRAC))
+        )
+        self.nam_trigger_high_frac = float(
+            os.getenv("NAM_TRIGGER_HIGH_FRAC", str(DEFAULT_NAM_TRIGGER_HIGH_FRAC))
+        )
+        self.nam_stage1_enabled = env_flag("NAM_STAGE1_ENABLED", False)
+        default_summary_tag = (
+            "context_summary"
+            if "qwen" in model_basename
+            else "minimax:context_summary"
+        )
+        self.context_summary_tag = os.getenv(
+            "CONTEXT_SUMMARY_TAG",
+            default_summary_tag,
+        )
+        self.context_summary_trigger_tokens = self.nam_max_memory_size
         self.context_total_token_limit = int(
             os.getenv("CONTEXT_TOTAL_TOKEN_LIMIT", "1000000")
         )
@@ -435,13 +478,41 @@ class MultiTurnReactAgent(FnCallAgent):
             "cumulative_token_usage_metric": "context_reset_prompt_tokens",
             "context_total_token_limit": self.context_total_token_limit,
             "context_summary_trigger_tokens": self.context_summary_trigger_tokens,
+            "nam_max_memory_size": self.nam_max_memory_size,
+            "nam_trigger_low_frac": self.nam_trigger_low_frac,
+            "nam_trigger_high_frac": self.nam_trigger_high_frac,
+            "nam_stage1_enabled": self.nam_stage1_enabled,
+            "context_summary_tag": self.context_summary_tag,
         }
+
+    def _get_summary_thresholds(self) -> Dict[str, int]:
+        low = int(self.nam_trigger_low_frac * self.nam_max_memory_size)
+        high = int(self.nam_trigger_high_frac * self.nam_max_memory_size)
+        return {
+            "low": low,
+            "high": high,
+            "max_memory_size": self.nam_max_memory_size,
+        }
+
+    def _max_llm_calls_per_run(self) -> int:
+        configured = os.getenv("MAX_LLM_CALL_PER_RUN")
+        if configured is not None:
+            return int(configured)
+        if self.context_management_strategy == "summary":
+            return 800
+        return MAX_LLM_CALL_PER_RUN
 
     def _latest_assistant_content(self, messages: List[Dict]) -> str:
         for message in reversed(messages):
             if message.get("role") == "assistant" and message.get("content"):
                 return strip_think_blocks(message["content"])
         return ""
+
+    def _last_user_index(self, messages: List[Dict]) -> Optional[int]:
+        for idx in range(len(messages) - 1, -1, -1):
+            if messages[idx].get("role") == "user":
+                return idx
+        return None
 
     def _format_message_for_summary(self, message: Dict, step_idx: int) -> str:
         role = message.get("role", "unknown")
@@ -552,6 +623,83 @@ structure and ensuring precision and thoroughness in your response.
 Directly output the summary content without any other text."""
         return [{"role": "user", "content": summary_prompt}]
 
+    def _build_stage1_request_messages(
+        self,
+        messages: List[Dict],
+        token_count: int,
+        thresholds: Dict[str, int],
+    ) -> List[Dict]:
+        transcript = self._format_conversation_history_for_summary(messages)
+        user_prompt = (
+            f"Current token count: {token_count}\n"
+            f"Low trigger threshold: {thresholds['low']}\n"
+            f"High pressure threshold: {thresholds['high']}\n"
+            f"Maximum active memory size: {thresholds['max_memory_size']}\n"
+            f"Message count: {len(messages)}\n\n"
+            "<conversation_history>\n"
+            f"{transcript}\n"
+            "</conversation_history>\n\n"
+            "Decide whether to summarize this context before the next assistant "
+            "response. Output exactly YES or NO after any thinking."
+        )
+        return [
+            {"role": "system", "content": NAM_STAGE1_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    def _parse_stage1_summary_decision(self, content: Optional[str]) -> bool:
+        decision = strip_think_blocks(content or "").strip().upper()
+        return bool(re.search(r"\bYES\b", decision))
+
+    def _should_summarize_with_stage1(
+        self,
+        messages: List[Dict],
+        token_count: int,
+        thresholds: Dict[str, int],
+        planning_port: int,
+    ) -> tuple[bool, Dict]:
+        stage1_messages = self._build_stage1_request_messages(
+            messages,
+            token_count,
+            thresholds,
+        )
+        stage1_response = self.call_server(
+            stage1_messages,
+            planning_port,
+            use_tools=False,
+        )
+        decision = self._parse_stage1_summary_decision(
+            stage1_response.get("content")
+        )
+        stage1_usage = self._get_call_usage(stage1_messages, stage1_response)
+        if stage1_usage and not stage1_response.get("_usage"):
+            stage1_response["_usage"] = copy.deepcopy(stage1_usage)
+        return decision, {
+            "stage1_decision": "YES" if decision else "NO",
+            "stage1_response": strip_think_blocks(stage1_response.get("content") or ""),
+            "stage1_usage": stage1_usage,
+        }
+
+    def _generate_summary_message(
+        self,
+        summary_request_messages: List[Dict],
+        planning_port: int,
+        max_attempts: int = 3,
+    ) -> Dict:
+        summary_message = {}
+        for attempt in range(max_attempts):
+            summary_message = self.call_server(
+                summary_request_messages,
+                planning_port,
+                use_tools=False,
+            )
+            if strip_think_blocks(summary_message.get("content") or ""):
+                if attempt:
+                    summary_message["_summary_retry_count"] = attempt
+                return summary_message
+
+        raise ValueError("summary failed")
+
     def _last_user_message(self, messages: List[Dict], question: str) -> Dict:
         for message in reversed(messages):
             if message.get("role") == "user":
@@ -569,13 +717,16 @@ Directly output the summary content without any other text."""
 
         return system_messages + [self._last_user_message(messages, question)]
 
-    def _append_summary_to_thinking(self, thinking_content: str, summary_text: str) -> str:
+    def _format_context_summary(self, summary_text: str) -> str:
         formatted_summary = (
-            "<minimax:context_summary>\n"
+            f"<{self.context_summary_tag}>\n"
             f"{summary_text}\n"
-            "</minimax:context_summary>\n\n"
+            f"</{self.context_summary_tag}>\n\n"
         )
-        return f"{thinking_content}{formatted_summary}"
+        return formatted_summary
+
+    def _prepend_summary_to_thinking(self, thinking_content: str, summary_text: str) -> str:
+        return f"{self._format_context_summary(summary_text)}{thinking_content}"
 
     def _inject_pending_summary_to_thinking(
         self, messages: List[Dict], pending_summary: Optional[str]
@@ -592,13 +743,13 @@ Directly output the summary content without any other text."""
                 thinking_content = strip_think_blocks(
                     thinking_payload.get("thinking") or ""
                 )
-                thinking_payload["thinking"] = self._append_summary_to_thinking(
+                thinking_payload["thinking"] = self._prepend_summary_to_thinking(
                     thinking_content,
                     pending_summary,
                 )
                 return True
             if isinstance(thinking_payload, str):
-                message["thinking"] = self._append_summary_to_thinking(
+                message["thinking"] = self._prepend_summary_to_thinking(
                     strip_think_blocks(thinking_payload),
                     pending_summary,
                 )
@@ -606,7 +757,7 @@ Directly output the summary content without any other text."""
 
             if message.get("reasoning_content"):
                 reasoning_content = strip_think_blocks(message["reasoning_content"])
-                message["reasoning_content"] = self._append_summary_to_thinking(
+                message["reasoning_content"] = self._prepend_summary_to_thinking(
                     reasoning_content,
                     pending_summary,
                 )
@@ -622,7 +773,7 @@ Directly output the summary content without any other text."""
                 thinking_content = strip_think_blocks(think_match.group(1))
                 new_thinking = (
                     "<think>"
-                    + self._append_summary_to_thinking(
+                    + self._prepend_summary_to_thinking(
                         thinking_content,
                         pending_summary,
                     )
@@ -637,7 +788,7 @@ Directly output the summary content without any other text."""
 
             message["content"] = (
                 "<think>"
-                + self._append_summary_to_thinking("", pending_summary)
+                + self._prepend_summary_to_thinking("", pending_summary)
                 + "</think>\n"
                 + content
             )
@@ -666,6 +817,35 @@ Directly output the summary content without any other text."""
                     function["arguments"] = json.dumps(arguments, ensure_ascii=False)
 
         return api_messages
+
+    def _with_context_awareness(
+        self,
+        messages: List[Dict],
+        cumulative_usage: Dict,
+    ) -> List[Dict]:
+        request_messages = copy.deepcopy(messages)
+        if self.context_management_strategy != "summary":
+            return request_messages
+
+        consumed = int(cumulative_usage.get("context_reset_prompt_tokens", 0))
+        remaining = max(self.context_total_token_limit - consumed, 0)
+        awareness = (
+            "\n\n<context_awareness>\n"
+            f"Remaining total context budget for this attempt: {remaining} tokens.\n"
+            f"Consumed context budget from summarized/reset history: {consumed} tokens.\n"
+            f"Total context budget for this attempt: {self.context_total_token_limit} tokens.\n"
+            "Use available tools efficiently. Older context may be summarized "
+            "when memory pressure is high.\n"
+            "</context_awareness>"
+        )
+
+        if request_messages and request_messages[0].get("role") == "system":
+            request_messages[0]["content"] = (
+                (request_messages[0].get("content") or "") + awareness
+            )
+            return request_messages
+
+        return [{"role": "system", "content": awareness.strip()}] + request_messages
 
     def _prepare_messages_for_template(self, messages: List[Dict]) -> List[Dict]:
         template_messages = self._strip_internal_message_fields(messages)
@@ -947,16 +1127,24 @@ Directly output the summary content without any other text."""
         )
         return remaining_tokens, prompt_tokens, max_input_tokens
 
-    def maybe_reset_context(self, messages, question, usage: Optional[Dict] = None):
+    def maybe_reset_context(
+        self,
+        messages,
+        question,
+        usage: Optional[Dict] = None,
+        planning_port: Optional[int] = None,
+    ):
         if self.context_management_strategy not in {"discard_all", "summary"}:
             return messages, None, None
 
         if self.context_management_strategy == "discard_all":
             max_input_tokens = self.llm_generate_cfg.get("max_input_tokens", 320000)
             reset_threshold_tokens = int(max_input_tokens * self.context_reset_threshold)
+            thresholds = None
         else:
             max_input_tokens = None
-            reset_threshold_tokens = self.context_summary_trigger_tokens
+            thresholds = self._get_summary_thresholds()
+            reset_threshold_tokens = thresholds["low"]
 
         token_count, token_count_source, token_usage = self._get_context_token_count(
             messages,
@@ -971,6 +1159,17 @@ Directly output the summary content without any other text."""
         }
         if self.context_management_strategy == "discard_all":
             reset_info["threshold_ratio"] = self.context_reset_threshold
+        else:
+            reset_info.update(
+                {
+                    "threshold_low": thresholds["low"],
+                    "threshold_high": thresholds["high"],
+                    "max_memory_size": thresholds["max_memory_size"],
+                    "threshold_low_frac": self.nam_trigger_low_frac,
+                    "threshold_high_frac": self.nam_trigger_high_frac,
+                    "stage1_enabled": self.nam_stage1_enabled,
+                }
+            )
         if token_usage:
             reset_info["usage"] = copy.deepcopy(token_usage)
 
@@ -980,6 +1179,58 @@ Directly output the summary content without any other text."""
             f"reset_threshold={reset_threshold_tokens}",
             flush=True,
         )
+
+        if self.context_management_strategy == "summary":
+            if not self.nam_stage1_enabled:
+                if token_count >= thresholds["max_memory_size"]:
+                    reset_info["summary_trigger"] = "forced"
+                    print(
+                        "context management: action=summary because "
+                        f"{token_count} >= {thresholds['max_memory_size']}",
+                        flush=True,
+                    )
+                    return messages, "summary", reset_info
+
+                print(
+                    "context management: action=none because NAM stage1 is "
+                    "disabled and active memory is below max",
+                    flush=True,
+                )
+                return messages, None, reset_info
+
+            if token_count >= thresholds["max_memory_size"]:
+                reset_info["summary_trigger"] = "forced"
+                print(
+                    "context management: action=summary because "
+                    f"{token_count} >= {thresholds['max_memory_size']}",
+                    flush=True,
+                )
+                return messages, "summary", reset_info
+
+            if planning_port is None:
+                raise ValueError("planning_port is required for NAM stage1 summary checks")
+
+            should_summarize, stage1_info = self._should_summarize_with_stage1(
+                messages,
+                token_count,
+                thresholds,
+                planning_port,
+            )
+            reset_info.update(stage1_info)
+            reset_info["summary_trigger"] = "stage1"
+            if should_summarize:
+                print(
+                    "context management: action=summary because NAM stage1 "
+                    "returned YES",
+                    flush=True,
+                )
+                return messages, "summary", reset_info
+
+            print(
+                "context management: action=none because NAM stage1 returned NO",
+                flush=True,
+            )
+            return messages, None, reset_info
 
         if token_count > reset_threshold_tokens:
             action = self.context_management_strategy
@@ -1026,7 +1277,7 @@ Directly output the summary content without any other text."""
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": question},
         ]
-        num_llm_calls_available = MAX_LLM_CALL_PER_RUN
+        num_llm_calls_available = self._max_llm_calls_per_run()
         round = 0
         termination = "unknown"
         context_fold_trigger_step = None
@@ -1131,14 +1382,24 @@ Directly output the summary content without any other text."""
                     if message.get("content") == self.tool_context_rewriter.fold_text:
                         context_fold_trigger_step = round
                         break
-            request_messages = copy.deepcopy(inference_messages)
-            assistant_message = self.call_server(
+            request_messages = self._with_context_awareness(
                 inference_messages,
+                cumulative_token_usage,
+            )
+            assistant_message = self.call_server(
+                request_messages,
                 planning_port,
                 use_tools=True,
             )
             print(f"Round {round}: {assistant_message}")
             messages.append(assistant_message)
+            if pending_summary_for_thinking:
+                injected = self._inject_pending_summary_to_thinking(
+                    messages,
+                    pending_summary_for_thinking,
+                )
+                if injected:
+                    pending_summary_for_thinking = None
 
             tool_calls = assistant_message.get("tool_calls", [])
             has_tool_call = bool(tool_calls)
@@ -1186,9 +1447,12 @@ Directly output the summary content without any other text."""
             if num_llm_calls_available <= 0:
                 messages.append({"role": "user", "content": FINAL_MESSAGE})
                 final_inference_messages = self._prepare_inference_messages(messages)
-                final_request_messages = copy.deepcopy(final_inference_messages)
-                assistant_message = self.call_server(
+                final_request_messages = self._with_context_awareness(
                     final_inference_messages,
+                    cumulative_token_usage,
+                )
+                assistant_message = self.call_server(
+                    final_request_messages,
                     planning_port,
                     use_tools=False,
                 )
@@ -1231,6 +1495,7 @@ Directly output the summary content without any other text."""
                 messages,
                 question,
                 usage=latest_usage,
+                planning_port=planning_port,
             )
             if context_action == "discard_all":
                 self._accumulate_context_reset_usage(
@@ -1273,14 +1538,19 @@ Directly output the summary content without any other text."""
                         flush=True,
                     )
                 else:
+                    last_user_idx = self._last_user_index(messages)
+                    messages_to_summarize = (
+                        messages[last_user_idx:]
+                        if last_user_idx is not None
+                        else messages
+                    )
                     summary_request_messages = self._build_summary_request_messages(
-                        messages,
+                        messages_to_summarize,
                         question,
                     )
-                    summary_message = self.call_server(
+                    summary_message = self._generate_summary_message(
                         summary_request_messages,
                         planning_port,
-                        use_tools=False,
                     )
                     summary_usage = self._get_call_usage(
                         summary_request_messages, summary_message
@@ -1310,6 +1580,8 @@ Directly output the summary content without any other text."""
                         "summary_text": summary_text,
                         "summary_usage": summary_usage,
                         "summary_injection": "pending_assistant_thinking",
+                        "summary_messages_start_index": last_user_idx,
+                        "summary_messages_count": len(messages_to_summarize),
                         "history_context_count": len(history_context),
                         **(reset_info or {}),
                     }
@@ -1369,9 +1641,12 @@ Directly output the summary content without any other text."""
 
                 messages.append({"role": "user", "content": TRUNCATED_MESSAGE + FINAL_MESSAGE})
                 truncated_inference_messages = self._prepare_inference_messages(messages)
-                truncated_request_messages = copy.deepcopy(truncated_inference_messages)
-                assistant_message = self.call_server(
+                truncated_request_messages = self._with_context_awareness(
                     truncated_inference_messages,
+                    cumulative_token_usage,
+                )
+                assistant_message = self.call_server(
+                    truncated_request_messages,
                     planning_port,
                     use_tools=False,
                 )
