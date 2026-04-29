@@ -12,6 +12,7 @@ from qwen_vllm_agent import QwenVllmReactAgent
 import time
 import math
 import re
+from typing import Dict, Optional
 
 
 def sanitize_tag_value(value: str) -> str:
@@ -32,6 +33,12 @@ def normalize_context_management_strategy(strategy: str) -> str:
     normalized = (strategy or "none").strip().lower().replace("-", "_")
     if normalized in {"discard", "discard_all"}:
         return "discard_all"
+    if normalized in {
+        "fold_then_discard",
+        "fold_tool_then_discard",
+        "fold_then_reset",
+    }:
+        return "fold_then_discard"
     if normalized in {
         "fold_tool",
         "fold_tools",
@@ -65,7 +72,8 @@ def make_task_id(item: dict, global_idx: int, rollout_idx: int, output_tag: str)
 
 
 def build_progress_writer(task_info: dict):
-    lifecycle = {"started_at": None}
+    resume_state = task_info.get("resume_state") or {}
+    lifecycle = {"started_at": resume_state.get("started_at")}
 
     def _write(snapshot: dict, final: bool = False):
         payload = copy.deepcopy(snapshot)
@@ -95,6 +103,29 @@ def build_progress_writer(task_info: dict):
         write_json_atomic(task_info["running_path"], payload)
 
     return _write
+
+
+def load_running_resume_state(running_path: str, question: str) -> Optional[Dict]:
+    enabled = os.getenv("WEBEXPLORER_RESUME_RUNNING", "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return None
+    if not os.path.exists(running_path):
+        return None
+    try:
+        with open(running_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"Warning: cannot resume from running snapshot {running_path}: {e}")
+        return None
+
+    if state.get("status") != "running":
+        return None
+    if not isinstance(state.get("messages"), list) or not state["messages"]:
+        return None
+    if (state.get("question") or "").strip() != question.strip():
+        print(f"Warning: ignoring stale running snapshot with mismatched question: {running_path}")
+        return None
+    return state
 
 
 def collect_processed_queries(output_file: str, finished_dir: str, rollout_idx: int) -> set:
@@ -133,7 +164,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="")
     parser.add_argument("--output", type=str, default="")
-    parser.add_argument("--dataset", type=str, default="gaia")
+    parser.add_argument("--dataset", type=str, default="bc_1_per_6")
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--max_workers", type=int, default=20)
@@ -167,18 +198,32 @@ if __name__ == "__main__":
     context_total_token_limit = os.getenv("CONTEXT_TOTAL_TOKEN_LIMIT", "1000000")
     tool_context_max = os.getenv("TOOL_CONTEXT_MAX", os.getenv("QWEN_TOOL_CONTEXT_MAX", "32000"))
     tool_context_target = os.getenv("TOOL_CONTEXT_TARGET", os.getenv("QWEN_TOOL_CONTEXT_TARGET", "5000"))
-    max_llm_call_per_run = os.getenv("MAX_LLM_CALL_PER_RUN", "100")
+    discard_prompt_threshold_ratio = os.getenv("DISCARD_PROMPT_THRESHOLD_RATIO", "0.85")
+    discard_history_tool_tokens = os.getenv("DISCARD_HISTORY_TOOL_TOKENS", "0")
+    discard_history_min_rounds = os.getenv("DISCARD_HISTORY_MIN_ROUNDS", "0")
+    discard_history_max_rounds = os.getenv("DISCARD_HISTORY_MAX_ROUNDS", "0")
+    default_max_llm_call_per_run = "200" if is_qwen_model(model) else "100"
+    max_llm_call_per_run = os.getenv(
+        "MAX_LLM_CALL_PER_RUN", default_max_llm_call_per_run
+    )
     output_tag = f"ctx-{sanitize_tag_value(context_strategy)}"
     if context_strategy == "summary":
         output_tag += (
             f"_sumctx-{sanitize_tag_value(context_summary_trigger_tokens)}"
             f"_tot-{sanitize_tag_value(context_total_token_limit)}"
         )
-    elif context_strategy == "fold_tool":
+    elif context_strategy in {"fold_tool", "fold_then_discard"}:
         output_tag += (
             f"_toolmax-{sanitize_tag_value(tool_context_max)}"
             f"_tooltarget-{sanitize_tag_value(tool_context_target)}"
         )
+        if context_strategy == "fold_then_discard":
+            output_tag += (
+                f"_discardthr-{sanitize_tag_value(discard_prompt_threshold_ratio)}"
+                f"_histtool-{sanitize_tag_value(discard_history_tool_tokens)}"
+                f"_minr-{sanitize_tag_value(discard_history_min_rounds)}"
+                f"_maxr-{sanitize_tag_value(discard_history_max_rounds)}"
+            )
     else:
         output_tag += f"_thr-{sanitize_tag_value(context_reset_threshold)}"
     output_tag += f"_turns-{sanitize_tag_value(max_llm_call_per_run)}"
@@ -313,6 +358,10 @@ if __name__ == "__main__":
                     "running_path": os.path.join(running_dir, f"{task_id}.json"),
                     "finished_path": os.path.join(finished_dir, f"{task_id}.json"),
                 }
+                task_info["resume_state"] = load_running_resume_state(
+                    task_info["running_path"],
+                    question,
+                )
                 task_info["progress_callback"] = build_progress_writer(task_info)
                 tasks_to_run_all.append({
                     **task_info,
@@ -326,10 +375,11 @@ if __name__ == "__main__":
     if not tasks_to_run_all:
         print("All rollouts have been completed and no execution is required.")
     else:
+        default_max_input_tokens = "262144" if is_qwen_model(model) else "196608"
         llm_cfg = {
             'model': model,
             'generate_cfg': {
-                'max_input_tokens': int(os.getenv("MAX_INPUT_TOKENS", "196608")),
+                'max_input_tokens': int(os.getenv("MAX_INPUT_TOKENS", default_max_input_tokens)),
                 'max_retries': 10,
                 'temperature': args.temperature,
                 'top_p': args.top_p,
@@ -364,11 +414,13 @@ if __name__ == "__main__":
                     auto_judge=args.auto_judge,
                     judge_engine=args.judge_engine,
                     progress_callback=task["progress_callback"],
+                    resume_state=task.get("resume_state"),
                     task_metadata={
                         "task_id": task["task_id"],
                         "rollout_idx": task["rollout_idx"],
                         "task_index": task["task_index"],
                         "output_tag": task["output_tag"],
+                        "dataset": args.dataset,
                     },
                 ): task for task in tasks_to_run_all
             }

@@ -29,6 +29,10 @@ from tool_webexplorer_search import *
 
 MAX_LLM_CALL_PER_RUN = int(os.getenv("MAX_LLM_CALL_PER_RUN", 100))
 MAX_TOKENS_SAFETY_MARGIN = int(os.getenv("MAX_TOKENS_SAFETY_MARGIN", "1024"))
+CONTEXT_SUMMARY_MAX_TOKENS_CAP = int(
+    os.getenv("CONTEXT_SUMMARY_MAX_TOKENS_CAP", "32768")
+)
+TASK_TIME_LIMIT_MINUTES = float(os.getenv("WEBEXPLORER_TASK_TIME_LIMIT_MINUTES", "150"))
 DEFAULT_NAM_MAX_MEMORY_SIZE = 32000
 DEFAULT_NAM_TRIGGER_LOW_FRAC = 0.25
 DEFAULT_NAM_TRIGGER_HIGH_FRAC = 0.75
@@ -44,6 +48,10 @@ You are forbidden to call any tools.
 You must offer your final answer now."""
 
 SYSTEM_PROMPT = "You are a helpful assistant."
+QWEN_REPRO_SYSTEM_PROMPT = (
+    "Search intensity is set to high. Please conduct thorough, multi-source "
+    "research and provide comprehensive, well-cited results."
+)
 MINIMAX_21_SYSTEM_PROMPT = "You are a helpful assistant. Your name is MiniMax-M2.1 and is built by MiniMax."
 MINIMAX_25_SYSTEM_PROMPT = "You are a helpful assistant. Your name is MiniMax-M2.5 and is built by MiniMax."
 NAM_STAGE1_PROMPT = """You are the context memory controller for an agent.
@@ -69,6 +77,16 @@ TOOL_CLASS = [
 TOOL_MAP = {tool.name: tool for tool in TOOL_CLASS}
 
 
+def task_time_limit_seconds() -> Optional[float]:
+    if TASK_TIME_LIMIT_MINUTES <= 0:
+        return None
+    return TASK_TIME_LIMIT_MINUTES * 60
+
+
+def task_time_limit_termination() -> str:
+    return f"No answer found after {TASK_TIME_LIMIT_MINUTES:g}mins"
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -87,6 +105,12 @@ def normalize_context_management_strategy(strategy: str) -> str:
     normalized = (strategy or "none").strip().lower().replace("-", "_")
     if normalized in {"discard", "discard_all"}:
         return "discard_all"
+    if normalized in {
+        "fold_then_discard",
+        "fold_tool_then_discard",
+        "fold_then_reset",
+    }:
+        return "fold_then_discard"
     if normalized in {
         "fold_tool",
         "fold_tools",
@@ -128,7 +152,7 @@ class ToolMessageContextRewriter:
             content = msg.get("content") or ""
         return self._encode_len(content)
 
-    def process(self, messages: List[Dict]) -> List[Dict]:
+    def _count_tool_tokens(self, messages: List[Dict]) -> tuple[int, Dict[int, int], List[int]]:
         total_tool_tokens = 0
         msg_lengths = {}
         tool_indices = []
@@ -140,8 +164,24 @@ class ToolMessageContextRewriter:
                 total_tool_tokens += length
                 tool_indices.append(idx)
 
+        return total_tool_tokens, msg_lengths, tool_indices
+
+    def tool_token_count(self, messages: List[Dict]) -> int:
+        total_tool_tokens, _, _ = self._count_tool_tokens(messages)
+        return total_tool_tokens
+
+    def process_with_stats(self, messages: List[Dict]) -> tuple[List[Dict], Dict]:
+        total_tool_tokens, msg_lengths, tool_indices = self._count_tool_tokens(messages)
+        stats = {
+            "tool_tokens_before": total_tool_tokens,
+            "tool_tokens_after": total_tool_tokens,
+            "tool_messages_before": len(tool_indices),
+            "folded_tool_messages": 0,
+            "fold_applied": False,
+        }
+
         if total_tool_tokens <= self.max_context_length:
-            return copy.deepcopy(messages)
+            return copy.deepcopy(messages), stats
 
         processed_msgs = copy.deepcopy(messages)
         current_tool_tokens = total_tool_tokens
@@ -163,10 +203,17 @@ class ToolMessageContextRewriter:
                 processed_msgs[idx]["content"] = self.fold_text
                 current_tool_tokens -= saved
                 masked_count += 1
+                stats["fold_applied"] = True
 
             if current_tool_tokens <= self.target_context_length:
                 break
 
+        stats["tool_tokens_after"] = current_tool_tokens
+        stats["folded_tool_messages"] = masked_count
+        return processed_msgs, stats
+
+    def process(self, messages: List[Dict]) -> List[Dict]:
+        processed_msgs, _ = self.process_with_stats(messages)
         return processed_msgs
 
 
@@ -180,10 +227,23 @@ class MultiTurnReactAgent(FnCallAgent):
         self.llm_generate_cfg = llm["generate_cfg"]
         self.llm_local_path = self._resolve_model_path(llm["model"])
         model_basename = os.path.basename(str(llm["model"]).rstrip("/")).lower()
+        self.is_qwen_model = "qwen" in model_basename
         self.context_management_strategy = normalize_context_management_strategy(
             os.getenv("CONTEXT_MANAGEMENT_STRATEGY", "none")
         )
         self.context_reset_threshold = float(os.getenv("CONTEXT_RESET_THRESHOLD", "0.3"))
+        self.discard_prompt_threshold_ratio = float(
+            os.getenv("DISCARD_PROMPT_THRESHOLD_RATIO", "0.85")
+        )
+        self.discard_history_tool_tokens = int(
+            os.getenv("DISCARD_HISTORY_TOOL_TOKENS", "0")
+        )
+        self.discard_history_min_rounds = int(
+            os.getenv("DISCARD_HISTORY_MIN_ROUNDS", "0")
+        )
+        self.discard_history_max_rounds = int(
+            os.getenv("DISCARD_HISTORY_MAX_ROUNDS", "0")
+        )
         self.nam_max_memory_size = int(
             os.getenv("NAM_MAX_MEMORY_SIZE", str(DEFAULT_NAM_MAX_MEMORY_SIZE))
         )
@@ -228,6 +288,9 @@ class MultiTurnReactAgent(FnCallAgent):
                 )
             ),
         )
+        self.tool_context_max = self.tool_context_rewriter.max_context_length
+        self.tool_context_target = self.tool_context_rewriter.target_context_length
+        self._last_context_fold_stats: Optional[Dict] = None
 
     def _available_tool_instances(self) -> List[BaseTool]:
         return [
@@ -285,9 +348,12 @@ class MultiTurnReactAgent(FnCallAgent):
         return tool_schemas
 
     def _prepare_inference_messages(self, messages: List[Dict]) -> List[Dict]:
-        if self.context_management_strategy != "fold_tool":
+        if self.context_management_strategy not in {"fold_tool", "fold_then_discard"}:
+            self._last_context_fold_stats = None
             return messages
-        return self.tool_context_rewriter.process(messages)
+        processed_messages, fold_stats = self.tool_context_rewriter.process_with_stats(messages)
+        self._last_context_fold_stats = fold_stats
+        return processed_messages
 
     def _get_tokenizer(self):
         if self._tokenizer_initialized:
@@ -317,14 +383,57 @@ class MultiTurnReactAgent(FnCallAgent):
             tool_call = tool_call.model_dump(exclude_none=True)
         return copy.deepcopy(tool_call)
 
+    def _normalize_reasoning_payload(self, reasoning_payload) -> str:
+        if reasoning_payload in (None, ""):
+            return ""
+        if isinstance(reasoning_payload, str):
+            return reasoning_payload
+        if isinstance(reasoning_payload, dict):
+            for key in (
+                "reasoning_content",
+                "reasoning",
+                "thinking",
+                "content",
+                "text",
+                "summary",
+            ):
+                value = reasoning_payload.get(key)
+                if value not in (None, ""):
+                    return self._normalize_reasoning_payload(value)
+            return json.dumps(reasoning_payload, ensure_ascii=False)
+        if isinstance(reasoning_payload, list):
+            parts = [
+                self._normalize_reasoning_payload(item)
+                for item in reasoning_payload
+            ]
+            return "\n".join(part for part in parts if part)
+        return str(reasoning_payload)
+
+    def _get_message_payload_field(self, message, field: str):
+        value = getattr(message, field, None)
+        if value not in (None, ""):
+            return value
+        if isinstance(message, dict):
+            return message.get(field)
+        if hasattr(message, "model_dump"):
+            payload = message.model_dump(exclude_none=True)
+            return payload.get(field)
+        return None
+
+    def _extract_reasoning_content(self, message) -> str:
+        reasoning_payload = self._get_message_payload_field(message, "reasoning_content")
+        if reasoning_payload in (None, ""):
+            reasoning_payload = self._get_message_payload_field(message, "reasoning")
+        return self._normalize_reasoning_payload(reasoning_payload)
+
     def _normalize_assistant_message(self, message) -> Dict:
         assistant_message = {
             "role": "assistant",
             "content": message.content or "",
         }
 
-        reasoning_content = getattr(message, "reasoning_content", None)
-        if reasoning_content is not None:
+        reasoning_content = self._extract_reasoning_content(message)
+        if reasoning_content:
             assistant_message["reasoning_content"] = reasoning_content
 
         if getattr(message, "tool_calls", None):
@@ -342,6 +451,12 @@ class MultiTurnReactAgent(FnCallAgent):
         ]
 
     def _move_thinking_to_reasoning_content(self, message: Dict) -> None:
+        reasoning_payload = message.pop("reasoning", None)
+        if not message.get("reasoning_content") and reasoning_payload not in (None, ""):
+            message["reasoning_content"] = self._normalize_reasoning_payload(
+                reasoning_payload
+            )
+
         thinking_payload = message.pop("thinking", None)
         if message.get("reasoning_content") or thinking_payload is None:
             return
@@ -464,12 +579,15 @@ class MultiTurnReactAgent(FnCallAgent):
         self, context_events: List[Dict], cumulative_usage: Dict
     ) -> Dict:
         discard_all_count = sum(
-            1 for event in context_events if event.get("strategy") == "discard_all"
+            1
+            for event in context_events
+            if event.get("action") == "discard_all" or event.get("strategy") == "discard_all"
         )
         summary_count = sum(
             1 for event in context_events if event.get("strategy") == "summary"
         )
         return {
+            "context_management_strategy": self.context_management_strategy,
             "context_management_count": len(context_events),
             "discard_all_count": discard_all_count,
             "summary_count": summary_count,
@@ -483,6 +601,13 @@ class MultiTurnReactAgent(FnCallAgent):
             "nam_trigger_high_frac": self.nam_trigger_high_frac,
             "nam_stage1_enabled": self.nam_stage1_enabled,
             "context_summary_tag": self.context_summary_tag,
+            "tool_context_max": self.tool_context_max,
+            "tool_context_target": self.tool_context_target,
+            "discard_prompt_threshold_ratio": self.discard_prompt_threshold_ratio,
+            "discard_history_tool_tokens": self.discard_history_tool_tokens,
+            "discard_history_min_rounds": self.discard_history_min_rounds,
+            "discard_history_max_rounds": self.discard_history_max_rounds,
+            "max_input_tokens": int(self.llm_generate_cfg.get("max_input_tokens", 196608)),
         }
 
     def _get_summary_thresholds(self) -> Dict[str, int]:
@@ -500,6 +625,8 @@ class MultiTurnReactAgent(FnCallAgent):
             return int(configured)
         if self.context_management_strategy == "summary":
             return 800
+        if self.is_qwen_model:
+            return 200
         return MAX_LLM_CALL_PER_RUN
 
     def _latest_assistant_content(self, messages: List[Dict]) -> str:
@@ -692,6 +819,7 @@ Directly output the summary content without any other text."""
                 summary_request_messages,
                 planning_port,
                 use_tools=False,
+                max_tokens_cap=CONTEXT_SUMMARY_MAX_TOKENS_CAP,
             )
             if strip_think_blocks(summary_message.get("content") or ""):
                 if attempt:
@@ -716,6 +844,28 @@ Directly output the summary content without any other text."""
             system_messages.append({"role": "system", "content": system_prompt})
 
         return system_messages + [self._last_user_message(messages, question)]
+
+    def _build_messages_after_discard(
+        self, messages: List[Dict], system_prompt: str, question: str
+    ) -> List[Dict]:
+        system_messages = []
+        if messages and messages[0].get("role") == "system":
+            system_messages.append(copy.deepcopy(messages[0]))
+        elif system_prompt:
+            system_messages.append({"role": "system", "content": system_prompt})
+
+        return system_messages + [self._last_user_message(messages, question)]
+
+    def _raw_tool_tokens_in_messages(self, messages: List[Dict]) -> int:
+        total = 0
+        for message in messages:
+            if message.get("role") != "tool":
+                continue
+            total += self._count_text_tokens(message.get("content") or "")
+        return total
+
+    def _assistant_rounds_in_messages(self, messages: List[Dict]) -> int:
+        return sum(1 for message in messages if message.get("role") == "assistant")
 
     def _format_context_summary(self, summary_text: str) -> str:
         formatted_summary = (
@@ -948,7 +1098,14 @@ Directly output the summary content without any other text."""
 
         progress_callback(payload, final=final)
 
-    def call_server(self, msgs, planning_port, use_tools=True, max_tries=10):
+    def call_server(
+        self,
+        msgs,
+        planning_port,
+        use_tools=True,
+        max_tries=10,
+        max_tokens_cap=None,
+    ):
         openai_api_key = "EMPTY"
         openai_api_base = f"http://127.0.0.1:{planning_port}/v1"
 
@@ -966,13 +1123,16 @@ Directly output the summary content without any other text."""
             )
         )
         remaining_tokens = max_input_tokens - prompt_tokens
+        if max_tokens_cap is not None:
+            dynamic_max_tokens = min(dynamic_max_tokens, max_tokens_cap)
         print(
             "dynamic max_tokens: "
             f"{dynamic_max_tokens} "
             f"(remaining_context_tokens={remaining_tokens}, "
             f"max_input_tokens={max_input_tokens}, "
             f"prompt_tokens={prompt_tokens}, "
-            f"safety_margin={MAX_TOKENS_SAFETY_MARGIN})",
+            f"safety_margin={MAX_TOKENS_SAFETY_MARGIN}, "
+            f"max_tokens_cap={max_tokens_cap})",
             flush=True,
         )
         if dynamic_max_tokens <= 0:
@@ -1127,28 +1287,51 @@ Directly output the summary content without any other text."""
         )
         return remaining_tokens, prompt_tokens, max_input_tokens
 
+    def _context_token_thresholds(self) -> tuple[Optional[int], Optional[int], Optional[Dict]]:
+        if self.context_management_strategy == "discard_all":
+            max_input_tokens = int(self.llm_generate_cfg.get("max_input_tokens", 320000))
+            reset_threshold_tokens = int(max_input_tokens * self.context_reset_threshold)
+            return max_input_tokens, reset_threshold_tokens, None
+
+        if self.context_management_strategy == "summary":
+            thresholds = self._get_summary_thresholds()
+            return None, thresholds["low"], thresholds
+
+        if self.context_management_strategy == "fold_then_discard":
+            max_input_tokens = int(self.llm_generate_cfg.get("max_input_tokens", 196608))
+            reset_threshold_tokens = int(
+                max_input_tokens * self.discard_prompt_threshold_ratio
+            )
+            return max_input_tokens, reset_threshold_tokens, None
+
+        return None, None, None
+
     def maybe_reset_context(
         self,
         messages,
         question,
         usage: Optional[Dict] = None,
         planning_port: Optional[int] = None,
+        system_prompt: Optional[str] = None,
     ):
-        if self.context_management_strategy not in {"discard_all", "summary"}:
+        if self.context_management_strategy not in {
+            "discard_all",
+            "summary",
+            "fold_then_discard",
+        }:
             return messages, None, None
 
-        if self.context_management_strategy == "discard_all":
-            max_input_tokens = self.llm_generate_cfg.get("max_input_tokens", 320000)
-            reset_threshold_tokens = int(max_input_tokens * self.context_reset_threshold)
-            thresholds = None
-        else:
-            max_input_tokens = None
-            thresholds = self._get_summary_thresholds()
-            reset_threshold_tokens = thresholds["low"]
+        max_input_tokens, reset_threshold_tokens, thresholds = self._context_token_thresholds()
+        evaluation_messages = messages
+        fold_stats = None
+        if self.context_management_strategy == "fold_then_discard":
+            evaluation_messages, fold_stats = self.tool_context_rewriter.process_with_stats(
+                messages
+            )
 
         token_count, token_count_source, token_usage = self._get_context_token_count(
-            messages,
-            usage=usage,
+            evaluation_messages,
+            usage=None if evaluation_messages is not messages else usage,
         )
         reset_info = {
             "strategy": self.context_management_strategy,
@@ -1157,8 +1340,18 @@ Directly output the summary content without any other text."""
             "threshold": reset_threshold_tokens,
             "max_input_tokens": max_input_tokens,
         }
+        history_tool_tokens = self._raw_tool_tokens_in_messages(messages)
+        rounds_since_reset = self._assistant_rounds_in_messages(messages)
+        reset_info.update(
+            {
+                "history_tool_tokens": history_tool_tokens,
+                "rounds_since_reset": rounds_since_reset,
+            }
+        )
         if self.context_management_strategy == "discard_all":
             reset_info["threshold_ratio"] = self.context_reset_threshold
+        elif self.context_management_strategy == "fold_then_discard":
+            reset_info["threshold_ratio"] = self.discard_prompt_threshold_ratio
         else:
             reset_info.update(
                 {
@@ -1172,6 +1365,8 @@ Directly output the summary content without any other text."""
             )
         if token_usage:
             reset_info["usage"] = copy.deepcopy(token_usage)
+        if fold_stats:
+            reset_info["fold_stats"] = copy.deepcopy(fold_stats)
 
         print(
             f"context management: strategy={self.context_management_strategy}, "
@@ -1179,6 +1374,57 @@ Directly output the summary content without any other text."""
             f"reset_threshold={reset_threshold_tokens}",
             flush=True,
         )
+
+        if self.context_management_strategy in {"discard_all", "fold_then_discard"}:
+            if (
+                self.discard_history_max_rounds > 0
+                and rounds_since_reset >= self.discard_history_max_rounds
+            ):
+                action = "discard_all"
+                reset_info["trigger"] = "history_max_rounds"
+                print(
+                    "context management: action=discard_all because "
+                    f"rounds_since_reset={rounds_since_reset} >= "
+                    f"discard_history_max_rounds={self.discard_history_max_rounds}",
+                    flush=True,
+                )
+                if self.context_management_strategy == "fold_then_discard":
+                    return (
+                        self._build_messages_after_discard(
+                            messages, system_prompt or "", question
+                        ),
+                        action,
+                        reset_info,
+                    )
+                return [{"role": "user", "content": question}], action, reset_info
+
+            if (
+                self.discard_history_tool_tokens > 0
+                and history_tool_tokens >= self.discard_history_tool_tokens
+                and (
+                    self.discard_history_min_rounds <= 0
+                    or rounds_since_reset >= self.discard_history_min_rounds
+                )
+            ):
+                action = "discard_all"
+                reset_info["trigger"] = "history_tool_tokens"
+                print(
+                    "context management: action=discard_all because "
+                    f"history_tool_tokens={history_tool_tokens} >= "
+                    f"discard_history_tool_tokens={self.discard_history_tool_tokens} "
+                    f"and rounds_since_reset={rounds_since_reset} >= "
+                    f"discard_history_min_rounds={self.discard_history_min_rounds}",
+                    flush=True,
+                )
+                if self.context_management_strategy == "fold_then_discard":
+                    return (
+                        self._build_messages_after_discard(
+                            messages, system_prompt or "", question
+                        ),
+                        action,
+                        reset_info,
+                    )
+                return [{"role": "user", "content": question}], action, reset_info
 
         if self.context_management_strategy == "summary":
             if not self.nam_stage1_enabled:
@@ -1233,17 +1479,29 @@ Directly output the summary content without any other text."""
             return messages, None, reset_info
 
         if token_count > reset_threshold_tokens:
-            action = self.context_management_strategy
+            action = "discard_all"
+            reset_info["trigger"] = "prompt_token_threshold"
             print(
                 f"context management: action={action} because "
                 f"{token_count} > {reset_threshold_tokens}",
                 flush=True,
             )
-            if action == "discard_all":
-                return [{"role": "user", "content": question}], action, reset_info
-            return messages, action, reset_info
+            if self.context_management_strategy == "fold_then_discard":
+                return (
+                    self._build_messages_after_discard(messages, system_prompt or "", question),
+                    action,
+                    reset_info,
+                )
+            return [{"role": "user", "content": question}], action, reset_info
 
         return messages, None, reset_info
+
+    def _system_prompt_for_run(self, model: str) -> str:
+        if "minimax-m2.5" in model.lower():
+            return SYSTEM_PROMPT
+        if "minimax-m2.1" in model.lower():
+            return MINIMAX_21_SYSTEM_PROMPT
+        return SYSTEM_PROMPT
 
     def _run(
         self,
@@ -1264,15 +1522,10 @@ Directly output the summary content without any other text."""
         planning_port = data["planning_port"]
         answer = data["item"]["answer"]
         self.user_prompt = question
-        if "minimax-m2.5" in model.lower():
-            # system_prompt = MINIMAX_25_SYSTEM_PROMPT
-            system_prompt = SYSTEM_PROMPT
-        elif "minimax-m2.1" in model.lower():
-            system_prompt = MINIMAX_21_SYSTEM_PROMPT
-        else:
-            system_prompt = SYSTEM_PROMPT
+        system_prompt = self._system_prompt_for_run(model)
         progress_callback = kwargs.get("progress_callback")
         task_metadata = kwargs.get("task_metadata", {})
+        resume_state = kwargs.get("resume_state") or {}
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": question},
@@ -1288,6 +1541,52 @@ Directly output the summary content without any other text."""
         }
         pending_summary_for_thinking = None
         history_context = []
+
+        resumed_from_running = False
+        if isinstance(resume_state, dict) and isinstance(resume_state.get("messages"), list):
+            messages = copy.deepcopy(resume_state["messages"])
+            round = int(resume_state.get("round") or 0)
+            remaining_calls = resume_state.get("num_llm_calls_available")
+            if isinstance(remaining_calls, int):
+                num_llm_calls_available = remaining_calls
+            else:
+                num_llm_calls_available = max(0, self._max_llm_calls_per_run() - round)
+            context_fold_trigger_step = resume_state.get("context_fold_trigger_step")
+            context_reset_events = copy.deepcopy(
+                resume_state.get("context_reset_events") or []
+            )
+            cumulative_token_usage = copy.deepcopy(
+                resume_state.get("cumulative_token_usage") or cumulative_token_usage
+            )
+            pending_summary_for_thinking = resume_state.get("pending_summary_for_thinking")
+            if (
+                not pending_summary_for_thinking
+                and resume_state.get("termination") == "context_summary"
+                and isinstance(resume_state.get("context_reset_event"), dict)
+            ):
+                pending_summary_for_thinking = resume_state["context_reset_event"].get(
+                    "summary_text"
+                )
+            resumed_from_running = True
+
+        def make_running_state_payload(extra: Optional[Dict] = None) -> Dict:
+            payload = {
+                **task_metadata,
+                **self._make_context_management_stats(
+                    context_reset_events, cumulative_token_usage
+                ),
+                "num_llm_calls_available": num_llm_calls_available,
+                "context_fold_trigger_step": context_fold_trigger_step,
+            }
+            if resumed_from_running:
+                payload["resumed_from_running"] = True
+                if resume_state.get("updated_at"):
+                    payload["resumed_snapshot_updated_at"] = resume_state.get("updated_at")
+            if pending_summary_for_thinking:
+                payload["pending_summary_for_thinking"] = pending_summary_for_thinking
+            if extra:
+                payload.update(extra)
+            return payload
 
         def finalize_result(prediction: str, termination_reason: str):
             result = {
@@ -1356,14 +1655,18 @@ Directly output the summary content without any other text."""
             round_idx=round,
             planning_port=planning_port,
             status="running",
-            extra_payload=task_metadata,
+            extra_payload=make_running_state_payload(),
             final=False,
         )
 
+        per_task_time_limit_seconds = task_time_limit_seconds()
         while num_llm_calls_available > 0:
-            if time.time() - start_time > 150 * 60:
-                prediction = "No answer found after 2h30mins"
-                termination = "No answer found after 2h30mins"
+            if (
+                per_task_time_limit_seconds is not None
+                and time.time() - start_time > per_task_time_limit_seconds
+            ):
+                prediction = task_time_limit_termination()
+                termination = task_time_limit_termination()
                 return finalize_result(prediction, termination)
 
             if pending_summary_for_thinking:
@@ -1424,10 +1727,9 @@ Directly output the summary content without any other text."""
                 prediction=assistant_message.get("content"),
                 termination=None,
                 extra_payload={
-                    **task_metadata,
+                    **make_running_state_payload(),
                     "num_llm_calls_available": num_llm_calls_available,
                     "has_tool_call": has_tool_call,
-                    "context_fold_trigger_step": context_fold_trigger_step,
                 },
                 final=False,
             )
@@ -1496,6 +1798,7 @@ Directly output the summary content without any other text."""
                 question,
                 usage=latest_usage,
                 planning_port=planning_port,
+                system_prompt=system_prompt,
             )
             if context_action == "discard_all":
                 self._accumulate_context_reset_usage(
@@ -1504,6 +1807,7 @@ Directly output the summary content without any other text."""
                 )
                 reset_event = {
                     "round": round,
+                    "action": "discard_all",
                     "messages_before_reset": messages_before_reset,
                     "messages_after_reset": len(messages),
                     "num_llm_calls_available": num_llm_calls_available,
@@ -1520,13 +1824,10 @@ Directly output the summary content without any other text."""
                     status="running",
                     prediction=assistant_message.get("content"),
                     termination="context_reset",
-                    extra_payload={
-                        **task_metadata,
+                    extra_payload=make_running_state_payload({
                         "context_reset_events": context_reset_events,
                         "context_reset_event": reset_event,
-                        "cumulative_token_usage": cumulative_token_usage,
-                        "context_fold_trigger_step": context_fold_trigger_step,
-                    },
+                    }),
                     final=False,
                 )
                 continue
@@ -1596,13 +1897,10 @@ Directly output the summary content without any other text."""
                         status="running",
                         prediction=assistant_message.get("content"),
                         termination="context_summary",
-                        extra_payload={
-                            **task_metadata,
+                        extra_payload=make_running_state_payload({
                             "context_reset_events": context_reset_events,
                             "context_reset_event": reset_event,
-                            "cumulative_token_usage": cumulative_token_usage,
-                            "context_fold_trigger_step": context_fold_trigger_step,
-                        },
+                        }),
                         final=False,
                     )
                     if (

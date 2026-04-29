@@ -26,6 +26,7 @@ OBS_START = '<tool_response>'
 OBS_END = '\n</tool_response>'
 
 MAX_LLM_CALL_PER_RUN = int(os.getenv('MAX_LLM_CALL_PER_RUN', 100))
+TASK_TIME_LIMIT_MINUTES = float(os.getenv("WEBEXPLORER_TASK_TIME_LIMIT_MINUTES", "150"))
 
 TRUNCATED_MESSAGE = """
 --- Maximum Length Limit Reached ---
@@ -45,6 +46,16 @@ TOOL_MAP = {tool.name: tool for tool in TOOL_CLASS}
 
 import random
 import datetime
+
+
+def task_time_limit_seconds() -> Optional[float]:
+    if TASK_TIME_LIMIT_MINUTES <= 0:
+        return None
+    return TASK_TIME_LIMIT_MINUTES * 60
+
+
+def task_time_limit_termination() -> str:
+    return f"No answer found after {TASK_TIME_LIMIT_MINUTES:g}mins"
 
 
 def today_date():
@@ -196,11 +207,14 @@ class MultiTurnReactAgent(FnCallAgent):
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
         round = 0
         context_reset_events = []
+        per_task_time_limit_seconds = task_time_limit_seconds()
         while num_llm_calls_available > 0:
-            # Check whether time is reached
-            if time.time() - start_time > 150 * 60:  # 150 minutes in seconds
-                prediction = 'No answer found after 2h30mins'
-                termination = 'No answer found after 2h30mins'
+            if (
+                per_task_time_limit_seconds is not None
+                and time.time() - start_time > per_task_time_limit_seconds
+            ):
+                prediction = task_time_limit_termination()
+                termination = task_time_limit_termination()
                 result = {
                     "question": question,
                     "answer": answer,

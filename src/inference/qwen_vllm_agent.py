@@ -6,7 +6,7 @@ from qwen_agent.tools import BaseTool
 from tool_qwen_code_interpreter import QwenCodeInterpreterTool
 from tool_qwen_web_extractor import QwenWebExtractorTool
 from tool_qwen_web_search import QwenWebSearchTool
-from vllm_react_agent import MultiTurnReactAgent
+from vllm_react_agent import MultiTurnReactAgent, QWEN_REPRO_SYSTEM_PROMPT
 
 
 class QwenVllmReactAgent(MultiTurnReactAgent):
@@ -24,3 +24,6 @@ class QwenVllmReactAgent(MultiTurnReactAgent):
             QwenWebSearchTool(),
             QwenWebExtractorTool(),
         ]
+
+    def _system_prompt_for_run(self, model: str) -> str:
+        return QWEN_REPRO_SYSTEM_PROMPT
