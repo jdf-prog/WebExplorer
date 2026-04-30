@@ -1,3 +1,4 @@
+import json
 import os
 from typing import Optional, Union
 
@@ -95,7 +96,12 @@ class QwenWebExtractorTool:
             return "[web_extractor] Invalid request format: missing 'urls' or 'goal'"
 
         if isinstance(urls, str):
-            urls = [urls]
+            try:
+                decoded = json.loads(urls)
+            except json.JSONDecodeError:
+                urls = [urls]
+            else:
+                urls = decoded if isinstance(decoded, list) else [urls]
         if not isinstance(urls, list) or not urls:
             return "[web_extractor] Error: 'urls' must be a non-empty list of strings"
 

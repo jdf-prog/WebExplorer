@@ -6,7 +6,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 
 from openai import APIConnectionError, APIError, APITimeoutError, OpenAI
 import tiktoken
@@ -228,10 +228,15 @@ class MultiTurnReactAgent(FnCallAgent):
         self.llm_local_path = self._resolve_model_path(llm["model"])
         model_basename = os.path.basename(str(llm["model"]).rstrip("/")).lower()
         self.is_qwen_model = "qwen" in model_basename
+        self.is_deepseek_model = "deepseek" in model_basename
         self.context_management_strategy = normalize_context_management_strategy(
             os.getenv("CONTEXT_MANAGEMENT_STRATEGY", "none")
         )
         self.context_reset_threshold = float(os.getenv("CONTEXT_RESET_THRESHOLD", "0.3"))
+        keep_system_default = "1" if self.is_deepseek_model else "0"
+        self.discard_all_keep_system_prompt = os.getenv(
+            "DISCARD_ALL_KEEP_SYSTEM_PROMPT", keep_system_default
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self.discard_prompt_threshold_ratio = float(
             os.getenv("DISCARD_PROMPT_THRESHOLD_RATIO", "0.85")
         )
@@ -608,6 +613,7 @@ class MultiTurnReactAgent(FnCallAgent):
             "discard_history_min_rounds": self.discard_history_min_rounds,
             "discard_history_max_rounds": self.discard_history_max_rounds,
             "max_input_tokens": int(self.llm_generate_cfg.get("max_input_tokens", 196608)),
+            "forced_finalize_context_tokens": self._forced_finalize_context_tokens(),
         }
 
     def _get_summary_thresholds(self) -> Dict[str, int]:
@@ -618,6 +624,13 @@ class MultiTurnReactAgent(FnCallAgent):
             "high": high,
             "max_memory_size": self.nam_max_memory_size,
         }
+
+    def _forced_finalize_context_tokens(self) -> int:
+        configured = os.getenv("FORCED_FINALIZE_CONTEXT_TOKENS")
+        if configured is not None and configured.strip():
+            return int(configured)
+        max_input_tokens = int(self.llm_generate_cfg.get("max_input_tokens", 196608))
+        return int(max_input_tokens * 0.8)
 
     def _max_llm_calls_per_run(self) -> int:
         configured = os.getenv("MAX_LLM_CALL_PER_RUN")
@@ -784,6 +797,7 @@ Directly output the summary content without any other text."""
         token_count: int,
         thresholds: Dict[str, int],
         planning_port: int,
+        request_log_callback: Optional[Callable[[Dict], None]] = None,
     ) -> tuple[bool, Dict]:
         stage1_messages = self._build_stage1_request_messages(
             messages,
@@ -794,6 +808,7 @@ Directly output the summary content without any other text."""
             stage1_messages,
             planning_port,
             use_tools=False,
+            request_log_callback=request_log_callback,
         )
         decision = self._parse_stage1_summary_decision(
             stage1_response.get("content")
@@ -812,6 +827,7 @@ Directly output the summary content without any other text."""
         summary_request_messages: List[Dict],
         planning_port: int,
         max_attempts: int = 3,
+        request_log_callback: Optional[Callable[[Dict], None]] = None,
     ) -> Dict:
         summary_message = {}
         for attempt in range(max_attempts):
@@ -820,6 +836,7 @@ Directly output the summary content without any other text."""
                 planning_port,
                 use_tools=False,
                 max_tokens_cap=CONTEXT_SUMMARY_MAX_TOKENS_CAP,
+                request_log_callback=request_log_callback,
             )
             if strip_think_blocks(summary_message.get("content") or ""):
                 if attempt:
@@ -855,6 +872,13 @@ Directly output the summary content without any other text."""
             system_messages.append({"role": "system", "content": system_prompt})
 
         return system_messages + [self._last_user_message(messages, question)]
+
+    def _build_discard_all_messages(
+        self, messages: List[Dict], system_prompt: str, question: str
+    ) -> List[Dict]:
+        if self.discard_all_keep_system_prompt:
+            return self._build_messages_after_discard(messages, system_prompt, question)
+        return [{"role": "user", "content": question}]
 
     def _raw_tool_tokens_in_messages(self, messages: List[Dict]) -> int:
         total = 0
@@ -1098,6 +1122,73 @@ Directly output the summary content without any other text."""
 
         progress_callback(payload, final=final)
 
+    def _configured_sampling_params(self) -> Dict:
+        sampling_params = {
+            "model": self.model,
+            "max_input_tokens": int(
+                self.llm_generate_cfg.get("max_input_tokens", 196608)
+            ),
+            "max_retries": int(self.llm_generate_cfg.get("max_retries", 10)),
+            "temperature": self.llm_generate_cfg.get("temperature", 0.6),
+            "top_p": self.llm_generate_cfg.get("top_p", 0.95),
+            "logprobs": False,
+        }
+        presence_penalty = self.llm_generate_cfg.get("presence_penalty")
+        if presence_penalty is not None:
+            sampling_params["presence_penalty"] = presence_penalty
+
+        extra_body = {}
+        top_k = self.llm_generate_cfg.get("top_k")
+        min_p = self.llm_generate_cfg.get("min_p")
+        repetition_penalty = self.llm_generate_cfg.get("repetition_penalty")
+        if top_k is not None:
+            extra_body["top_k"] = top_k
+        if min_p is not None:
+            extra_body["min_p"] = min_p
+        if repetition_penalty is not None:
+            extra_body["repetition_penalty"] = repetition_penalty
+        chat_template_kwargs = self._chat_template_kwargs()
+        if chat_template_kwargs:
+            extra_body["chat_template_kwargs"] = chat_template_kwargs
+        if extra_body:
+            sampling_params["extra_body"] = extra_body
+
+        return sampling_params
+
+    def _build_sampling_request_info(
+        self,
+        request_kwargs: Dict,
+        *,
+        attempt: int,
+        max_tries: int,
+        use_tools: bool,
+        prompt_tokens: int,
+        max_input_tokens: int,
+        remaining_tokens: int,
+        max_tokens_cap: Optional[int],
+    ) -> Dict:
+        request_info = {
+            "attempt": attempt,
+            "max_tries": max_tries,
+            "model": request_kwargs.get("model", self.model),
+            "temperature": request_kwargs.get("temperature"),
+            "top_p": request_kwargs.get("top_p"),
+            "logprobs": request_kwargs.get("logprobs"),
+            "max_tokens": request_kwargs.get("max_tokens"),
+            "use_tools": use_tools,
+            "tool_count": len(self.tool_schemas) if use_tools else 0,
+            "prompt_tokens": prompt_tokens,
+            "max_input_tokens": max_input_tokens,
+            "remaining_context_tokens": remaining_tokens,
+            "max_tokens_cap": max_tokens_cap,
+            "safety_margin": MAX_TOKENS_SAFETY_MARGIN,
+        }
+        if "presence_penalty" in request_kwargs:
+            request_info["presence_penalty"] = request_kwargs["presence_penalty"]
+        if "extra_body" in request_kwargs:
+            request_info["extra_body"] = copy.deepcopy(request_kwargs["extra_body"])
+        return request_info
+
     def call_server(
         self,
         msgs,
@@ -1105,6 +1196,7 @@ Directly output the summary content without any other text."""
         use_tools=True,
         max_tries=10,
         max_tokens_cap=None,
+        request_log_callback: Optional[Callable[[Dict], None]] = None,
     ):
         openai_api_key = "EMPTY"
         openai_api_base = f"http://127.0.0.1:{planning_port}/v1"
@@ -1136,6 +1228,22 @@ Directly output the summary content without any other text."""
             flush=True,
         )
         if dynamic_max_tokens <= 0:
+            if request_log_callback is not None:
+                request_log_callback(
+                    {
+                        **self._configured_sampling_params(),
+                        "attempt": 0,
+                        "max_tries": max_tries,
+                        "use_tools": use_tools,
+                        "tool_count": len(self.tool_schemas) if use_tools else 0,
+                        "status": "input_token_limit_reached",
+                        "prompt_tokens": prompt_tokens,
+                        "remaining_context_tokens": remaining_tokens,
+                        "max_tokens": dynamic_max_tokens,
+                        "max_tokens_cap": max_tokens_cap,
+                        "safety_margin": MAX_TOKENS_SAFETY_MARGIN,
+                    }
+                )
             return {
                 "role": "assistant",
                 "content": "",
@@ -1158,7 +1266,7 @@ Directly output the summary content without any other text."""
                     "messages": self._prepare_messages_for_api(msgs),
                     "temperature": self.llm_generate_cfg.get("temperature", 0.6),
                     "top_p": self.llm_generate_cfg.get("top_p", 0.95),
-                    "logprobs": True,
+                    "logprobs": False,
                     "max_tokens": dynamic_max_tokens,
                 }
                 presence_penalty = self.llm_generate_cfg.get("presence_penalty")
@@ -1174,11 +1282,24 @@ Directly output the summary content without any other text."""
                     extra_body["min_p"] = min_p
                 if repetition_penalty is not None:
                     extra_body["repetition_penalty"] = repetition_penalty
+                chat_template_kwargs = self._chat_template_kwargs()
+                if chat_template_kwargs:
+                    extra_body["chat_template_kwargs"] = chat_template_kwargs
                 if extra_body:
                     request_kwargs["extra_body"] = extra_body
                 if use_tools:
                     request_kwargs["tools"] = self.tool_schemas
 
+                request_info = self._build_sampling_request_info(
+                    request_kwargs,
+                    attempt=attempt + 1,
+                    max_tries=max_tries,
+                    use_tools=use_tools,
+                    prompt_tokens=prompt_tokens,
+                    max_input_tokens=max_input_tokens,
+                    remaining_tokens=remaining_tokens,
+                    max_tokens_cap=max_tokens_cap,
+                )
                 chat_response = client.chat.completions.create(**request_kwargs)
                 choice = chat_response.choices[0]
                 message = choice.message
@@ -1196,12 +1317,50 @@ Directly output the summary content without any other text."""
                         assistant_message["_usage"] = usage
                     if finish_reason:
                         assistant_message["_finish_reason"] = finish_reason
+                    request_info["status"] = "success"
+                    request_info["finish_reason"] = finish_reason
+                    request_info["has_tool_calls"] = has_tool_calls
+                    if usage:
+                        request_info["usage"] = copy.deepcopy(usage)
+                    if request_log_callback is not None:
+                        request_log_callback(request_info)
                     return assistant_message
 
+                request_info["status"] = "empty_response"
+                if request_log_callback is not None:
+                    request_log_callback(request_info)
                 print(f"Warning: Attempt {attempt + 1} received an empty response.")
             except (APIError, APIConnectionError, APITimeoutError) as e:
+                if request_log_callback is not None:
+                    request_log_callback(
+                        {
+                            **locals().get("request_info", {}),
+                            "attempt": attempt + 1,
+                            "max_tries": max_tries,
+                            "model": self.model,
+                            "use_tools": use_tools,
+                            "tool_count": len(self.tool_schemas) if use_tools else 0,
+                            "status": "api_error",
+                            "error_type": type(e).__name__,
+                            "error": str(e),
+                        }
+                    )
                 print(f"Error: Attempt {attempt + 1} failed with an API or network error: {e}")
             except Exception as e:
+                if request_log_callback is not None:
+                    request_log_callback(
+                        {
+                            **locals().get("request_info", {}),
+                            "attempt": attempt + 1,
+                            "max_tries": max_tries,
+                            "model": self.model,
+                            "use_tools": use_tools,
+                            "tool_count": len(self.tool_schemas) if use_tools else 0,
+                            "status": "error",
+                            "error_type": type(e).__name__,
+                            "error": str(e),
+                        }
+                    )
                 print(f"Error: Attempt {attempt + 1} failed with an unexpected error: {e}")
 
             if attempt < max_tries - 1:
@@ -1313,6 +1472,7 @@ Directly output the summary content without any other text."""
         usage: Optional[Dict] = None,
         planning_port: Optional[int] = None,
         system_prompt: Optional[str] = None,
+        request_log_callback: Optional[Callable[[Dict], None]] = None,
     ):
         if self.context_management_strategy not in {
             "discard_all",
@@ -1350,6 +1510,7 @@ Directly output the summary content without any other text."""
         )
         if self.context_management_strategy == "discard_all":
             reset_info["threshold_ratio"] = self.context_reset_threshold
+            reset_info["keep_system_prompt"] = self.discard_all_keep_system_prompt
         elif self.context_management_strategy == "fold_then_discard":
             reset_info["threshold_ratio"] = self.discard_prompt_threshold_ratio
         else:
@@ -1396,7 +1557,11 @@ Directly output the summary content without any other text."""
                         action,
                         reset_info,
                     )
-                return [{"role": "user", "content": question}], action, reset_info
+                return (
+                    self._build_discard_all_messages(messages, system_prompt or "", question),
+                    action,
+                    reset_info,
+                )
 
             if (
                 self.discard_history_tool_tokens > 0
@@ -1424,7 +1589,11 @@ Directly output the summary content without any other text."""
                         action,
                         reset_info,
                     )
-                return [{"role": "user", "content": question}], action, reset_info
+                return (
+                    self._build_discard_all_messages(messages, system_prompt or "", question),
+                    action,
+                    reset_info,
+                )
 
         if self.context_management_strategy == "summary":
             if not self.nam_stage1_enabled:
@@ -1461,6 +1630,7 @@ Directly output the summary content without any other text."""
                 token_count,
                 thresholds,
                 planning_port,
+                request_log_callback=request_log_callback,
             )
             reset_info.update(stage1_info)
             reset_info["summary_trigger"] = "stage1"
@@ -1492,7 +1662,11 @@ Directly output the summary content without any other text."""
                     action,
                     reset_info,
                 )
-            return [{"role": "user", "content": question}], action, reset_info
+            return (
+                self._build_discard_all_messages(messages, system_prompt or "", question),
+                action,
+                reset_info,
+            )
 
         return messages, None, reset_info
 
@@ -1502,6 +1676,27 @@ Directly output the summary content without any other text."""
         if "minimax-m2.1" in model.lower():
             return MINIMAX_21_SYSTEM_PROMPT
         return SYSTEM_PROMPT
+
+    def _deepseek_reasoning_effort(self) -> Optional[str]:
+        thinking_mode = os.getenv("DEEPSEEK_THINKING_MODE", "think_max").strip().lower()
+        if thinking_mode in {"think", "think_high", "think-high", "high"}:
+            return "high"
+        if thinking_mode in {"think_max", "think-max", "max"}:
+            return "max"
+        return None
+
+    def _chat_template_kwargs(self) -> Optional[Dict[str, Union[bool, str]]]:
+        if "deepseek" not in self.model.lower():
+            return None
+
+        reasoning_effort = self._deepseek_reasoning_effort()
+        if reasoning_effort is None:
+            return None
+
+        return {
+            "thinking": True,
+            "reasoning_effort": reasoning_effort,
+        }
 
     def _run(
         self,
@@ -1526,6 +1721,25 @@ Directly output the summary content without any other text."""
         progress_callback = kwargs.get("progress_callback")
         task_metadata = kwargs.get("task_metadata", {})
         resume_state = kwargs.get("resume_state") or {}
+        sampling_params = self._configured_sampling_params()
+        sampling_request_history = copy.deepcopy(
+            resume_state.get("sampling_request_history") or []
+        )
+
+        def record_sampling_request(request_info: Dict) -> None:
+            sampling_request_history.append(copy.deepcopy(request_info))
+
+        def make_sampling_state_payload() -> Dict:
+            payload = {
+                "sampling_params": copy.deepcopy(sampling_params),
+                "sampling_request_history": copy.deepcopy(sampling_request_history),
+            }
+            if sampling_request_history:
+                payload["latest_sampling_request"] = copy.deepcopy(
+                    sampling_request_history[-1]
+                )
+            return payload
+
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": question},
@@ -1572,6 +1786,7 @@ Directly output the summary content without any other text."""
         def make_running_state_payload(extra: Optional[Dict] = None) -> Dict:
             payload = {
                 **task_metadata,
+                **make_sampling_state_payload(),
                 **self._make_context_management_stats(
                     context_reset_events, cumulative_token_usage
                 ),
@@ -1600,6 +1815,7 @@ Directly output the summary content without any other text."""
                 "termination": termination_reason,
                 "context_fold_trigger_step": context_fold_trigger_step,
             }
+            result.update(make_sampling_state_payload())
             result.update(
                 self._make_context_management_stats(
                     context_reset_events, cumulative_token_usage
@@ -1618,7 +1834,7 @@ Directly output the summary content without any other text."""
                     status="judging",
                     prediction=prediction,
                     termination=termination_reason,
-                    extra_payload=task_metadata,
+                    extra_payload=make_running_state_payload(),
                     final=False,
                 )
 
@@ -1636,12 +1852,8 @@ Directly output the summary content without any other text."""
                 prediction=result.get("prediction"),
                 termination=result.get("termination"),
                 extra_payload={
-                    **task_metadata,
+                    **make_running_state_payload(),
                     "auto_judge": result.get("auto_judge"),
-                    **self._make_context_management_stats(
-                        context_reset_events, cumulative_token_usage
-                    ),
-                    "context_fold_trigger_step": context_fold_trigger_step,
                 },
                 final=True,
             )
@@ -1693,6 +1905,7 @@ Directly output the summary content without any other text."""
                 request_messages,
                 planning_port,
                 use_tools=True,
+                request_log_callback=record_sampling_request,
             )
             print(f"Round {round}: {assistant_message}")
             messages.append(assistant_message)
@@ -1757,6 +1970,7 @@ Directly output the summary content without any other text."""
                     final_request_messages,
                     planning_port,
                     use_tools=False,
+                    request_log_callback=record_sampling_request,
                 )
                 messages.append(assistant_message)
                 self._ensure_message_usage(
@@ -1783,11 +1997,7 @@ Directly output the summary content without any other text."""
                     status="running",
                     prediction=prediction,
                     termination=termination,
-                    extra_payload={
-                        **task_metadata,
-                        "cumulative_token_usage": cumulative_token_usage,
-                        "context_fold_trigger_step": context_fold_trigger_step,
-                    },
+                    extra_payload=make_running_state_payload(),
                     final=False,
                 )
                 return finalize_result(prediction, termination)
@@ -1799,6 +2009,7 @@ Directly output the summary content without any other text."""
                 usage=latest_usage,
                 planning_port=planning_port,
                 system_prompt=system_prompt,
+                request_log_callback=record_sampling_request,
             )
             if context_action == "discard_all":
                 self._accumulate_context_reset_usage(
@@ -1852,6 +2063,7 @@ Directly output the summary content without any other text."""
                     summary_message = self._generate_summary_message(
                         summary_request_messages,
                         planning_port,
+                        request_log_callback=record_sampling_request,
                     )
                     summary_usage = self._get_call_usage(
                         summary_request_messages, summary_message
@@ -1919,7 +2131,7 @@ Directly output the summary content without any other text."""
                         return finalize_result(prediction, termination)
                     continue
 
-            max_tokens = 108 * 1024
+            max_tokens = self._forced_finalize_context_tokens()
             if reset_info and reset_info.get("token_count") is not None:
                 token_count = reset_info["token_count"]
                 token_count_source = reset_info.get("token_count_source")
@@ -1947,6 +2159,7 @@ Directly output the summary content without any other text."""
                     truncated_request_messages,
                     planning_port,
                     use_tools=False,
+                    request_log_callback=record_sampling_request,
                 )
                 messages.append(assistant_message)
                 self._ensure_message_usage(
@@ -1973,11 +2186,7 @@ Directly output the summary content without any other text."""
                     status="running",
                     prediction=prediction,
                     termination=termination,
-                    extra_payload={
-                        **task_metadata,
-                        "cumulative_token_usage": cumulative_token_usage,
-                        "context_fold_trigger_step": context_fold_trigger_step,
-                    },
+                    extra_payload=make_running_state_payload(),
                     final=False,
                 )
                 return finalize_result(prediction, termination)

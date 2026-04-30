@@ -1,17 +1,100 @@
+import json
 import os
 import random
 import time
+from pathlib import Path
 from typing import List, Optional, Union
 
 import requests
 
 
 SERPER_API_KEY = os.getenv("SERPER_KEY_ID", "")
+SERPER_CACHE_ENABLED = os.environ.get("SERPER_CACHE_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+SERPER_CACHE_PATH = os.environ.get(
+    "SERPER_CACHE_PATH",
+    "./cache/serper_search_cache.jsonl",
+)
+_SERPER_CACHE = None
+
+
+def _normalize_cache_query(query: str) -> str:
+    return query.strip()
+
+
+def _load_serper_cache() -> dict:
+    global _SERPER_CACHE
+    if _SERPER_CACHE is not None:
+        return _SERPER_CACHE
+
+    cache = {}
+    cache_path = Path(SERPER_CACHE_PATH)
+    if cache_path.exists():
+        try:
+            with cache_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    query = item.get("query")
+                    content = item.get("content")
+                    if isinstance(query, str) and isinstance(content, str):
+                        cache[_normalize_cache_query(query)] = content
+        except OSError as exc:
+            print(f"serper cache load error: {exc}", flush=True)
+
+    _SERPER_CACHE = cache
+    return _SERPER_CACHE
+
+
+def _append_serper_cache(query: str, content: str, topk: int) -> None:
+    if not SERPER_CACHE_ENABLED:
+        return
+
+    cache_path = Path(SERPER_CACHE_PATH)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "query": query,
+        "content": content,
+        "topk": topk,
+        "engine": "serper",
+        "cached_at": int(time.time()),
+    }
+    try:
+        with cache_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        print(f"serper cache write error: {exc}", flush=True)
+
+
+def _get_serper_cache_hit(query: str) -> Optional[str]:
+    if not SERPER_CACHE_ENABLED:
+        return None
+    return _load_serper_cache().get(_normalize_cache_query(query))
+
+
+def _store_serper_cache(query: str, content: str, topk: int) -> None:
+    if not SERPER_CACHE_ENABLED:
+        return
+    normalized_query = _normalize_cache_query(query)
+    cache = _load_serper_cache()
+    cache[normalized_query] = content
+    _append_serper_cache(normalized_query, content, topk)
 
 
 def get_search_results(query: str, topk: int = 10, max_retry: int = 3) -> str:
     if not SERPER_API_KEY:
         raise ValueError("SERPER_KEY_ID environment variable is not set")
+
+    cached_result = _get_serper_cache_hit(query)
+    if cached_result is not None:
+        print(f"serper cache hit: {query}", flush=True)
+        return cached_result
 
     url = "https://google.serper.dev/search"
     headers = {
@@ -48,7 +131,9 @@ def get_search_results(query: str, topk: int = 10, max_retry: int = 3) -> str:
                     )
                 )
 
-            return "\n\n".join(snippets)
+            content = "\n\n".join(snippets)
+            _store_serper_cache(query, content, topk)
+            return content
         except Exception as exc:
             print(f"qwen web_search retry {retry_cnt} error: {exc}", flush=True)
             if retry_cnt == max_retry - 1:
@@ -98,7 +183,12 @@ class QwenWebSearchTool:
             return "[web_search] Invalid request format: missing 'queries'"
 
         if isinstance(queries, str):
-            queries = [queries]
+            try:
+                decoded = json.loads(queries)
+            except json.JSONDecodeError:
+                queries = [queries]
+            else:
+                queries = decoded if isinstance(decoded, list) else [queries]
         if not isinstance(queries, list):
             return "[web_search] Error: 'queries' must be a list of strings"
 

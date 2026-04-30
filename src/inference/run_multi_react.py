@@ -9,6 +9,7 @@ import threading
 from datetime import datetime, timezone
 from vllm_react_agent import MultiTurnReactAgent
 from qwen_vllm_agent import QwenVllmReactAgent
+from deepseek_vllm_agent import DeepSeekVllmReactAgent
 import time
 import math
 import re
@@ -55,6 +56,10 @@ def normalize_context_management_strategy(strategy: str) -> str:
 
 def is_qwen_model(model_name: str) -> bool:
     return "qwen" in os.path.basename(model_name.rstrip("/")).lower()
+
+
+def is_deepseek_model(model_name: str) -> bool:
+    return "deepseek" in os.path.basename(model_name.rstrip("/")).lower()
 
 
 def write_json_atomic(path: str, payload: dict) -> None:
@@ -202,7 +207,12 @@ if __name__ == "__main__":
     discard_history_tool_tokens = os.getenv("DISCARD_HISTORY_TOOL_TOKENS", "0")
     discard_history_min_rounds = os.getenv("DISCARD_HISTORY_MIN_ROUNDS", "0")
     discard_history_max_rounds = os.getenv("DISCARD_HISTORY_MAX_ROUNDS", "0")
-    default_max_llm_call_per_run = "200" if is_qwen_model(model) else "100"
+    if is_deepseek_model(model):
+        default_max_llm_call_per_run = "500"
+    elif is_qwen_model(model):
+        default_max_llm_call_per_run = "200"
+    else:
+        default_max_llm_call_per_run = "100"
     max_llm_call_per_run = os.getenv(
         "MAX_LLM_CALL_PER_RUN", default_max_llm_call_per_run
     )
@@ -227,6 +237,9 @@ if __name__ == "__main__":
     else:
         output_tag += f"_thr-{sanitize_tag_value(context_reset_threshold)}"
     output_tag += f"_turns-{sanitize_tag_value(max_llm_call_per_run)}"
+    if is_deepseek_model(model):
+        deepseek_thinking_mode = os.getenv("DEEPSEEK_THINKING_MODE", "think_max")
+        output_tag += f"_think-{sanitize_tag_value(deepseek_thinking_mode)}"
 
     model_dir = os.path.join(output_base, f"{model_name}")
     dataset_base_dir = os.path.join(model_dir, args.dataset)
@@ -375,7 +388,12 @@ if __name__ == "__main__":
     if not tasks_to_run_all:
         print("All rollouts have been completed and no execution is required.")
     else:
-        default_max_input_tokens = "262144" if is_qwen_model(model) else "196608"
+        if is_deepseek_model(model):
+            default_max_input_tokens = "524288"
+        elif is_qwen_model(model):
+            default_max_input_tokens = "262144"
+        else:
+            default_max_input_tokens = "196608"
         llm_cfg = {
             'model': model,
             'generate_cfg': {
@@ -391,7 +409,12 @@ if __name__ == "__main__":
             'model_type': 'qwen_dashscope'
         }
 
-        if is_qwen_model(model):
+        if is_deepseek_model(model):
+            test_agent = DeepSeekVllmReactAgent(
+                llm=llm_cfg,
+                function_list=["code_interpreter", "web_search", "web_extractor"],
+            )
+        elif is_qwen_model(model):
             test_agent = QwenVllmReactAgent(
                 llm=llm_cfg,
                 function_list=["code_interpreter", "web_search", "web_extractor"],

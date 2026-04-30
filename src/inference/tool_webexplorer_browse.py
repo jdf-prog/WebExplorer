@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import time
@@ -301,7 +302,12 @@ class WebExplorerBrowse(BaseTool):
             return "[Browse] Invalid request format: Input must be a JSON object containing 'urls' and 'query' fields"
 
         if isinstance(urls, str):
-            urls = [urls]
+            try:
+                decoded = json.loads(urls)
+            except json.JSONDecodeError:
+                urls = [urls]
+            else:
+                urls = decoded if isinstance(decoded, list) else [urls]
 
         if not urls or not isinstance(urls, list) or not all(isinstance(url, str) and url for url in urls):
             return "[Browse] Error: 'urls' is missing, empty, or not a list of strings"
