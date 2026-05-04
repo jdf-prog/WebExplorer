@@ -2,12 +2,13 @@ import argparse
 import copy
 import json
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import concurrent.futures
 from tqdm import tqdm
 import threading
 from datetime import datetime, timezone
-from vllm_react_agent import MultiTurnReactAgent
+from vllm_react_agent import MultiTurnReactAgent, VllmServerError
 from qwen_vllm_agent import QwenVllmReactAgent
 from deepseek_vllm_agent import DeepSeekVllmReactAgent
 import time
@@ -70,17 +71,41 @@ def write_json_atomic(path: str, payload: dict) -> None:
     os.replace(temp_path, path)
 
 
+def remove_file_if_exists(path: str) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def cleanup_task_artifacts(task_info: dict) -> None:
+    remove_file_if_exists(task_info["running_path"])
+    remove_file_if_exists(task_info["finished_path"])
+
+
+def hard_exit_due_to_vllm_error(message: str, exit_code: int = 2) -> None:
+    print(message, flush=True)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        # Hard-exit so a dead vLLM server does not leave the evaluator writing junk records.
+        os._exit(exit_code)
+
+
 def make_task_id(item: dict, global_idx: int, rollout_idx: int, output_tag: str) -> str:
     raw_task_id = item.get("id") or f"task_{global_idx:04d}"
     base_task_id = sanitize_file_stem(raw_task_id)
     return f"{base_task_id}_{sanitize_file_stem(output_tag)}_iter{rollout_idx}"
 
 
-def build_progress_writer(task_info: dict):
+def build_progress_writer(task_info: dict, abort_event: Optional[threading.Event] = None):
     resume_state = task_info.get("resume_state") or {}
     lifecycle = {"started_at": resume_state.get("started_at")}
 
     def _write(snapshot: dict, final: bool = False):
+        if abort_event is not None and abort_event.is_set():
+            return
         payload = copy.deepcopy(snapshot)
         now = utc_now_iso()
 
@@ -311,6 +336,7 @@ if __name__ == "__main__":
         }
     
     processed_queries_per_rollout = {}
+    abort_event = threading.Event()
 
     for rollout_idx in range(1, roll_out_count + 1):
         output_file = output_files[rollout_idx]
@@ -375,7 +401,9 @@ if __name__ == "__main__":
                     task_info["running_path"],
                     question,
                 )
-                task_info["progress_callback"] = build_progress_writer(task_info)
+                task_info["progress_callback"] = build_progress_writer(
+                    task_info, abort_event=abort_event
+                )
                 tasks_to_run_all.append({
                     **task_info,
                 })
@@ -427,6 +455,7 @@ if __name__ == "__main__":
         tool_schemas = copy.deepcopy(getattr(test_agent, "tool_schemas", []))
 
         write_locks = {i: threading.Lock() for i in range(1, roll_out_count + 1)}
+        persisted_task_ids = set()
 
         with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
             future_to_task = {
@@ -460,6 +489,19 @@ if __name__ == "__main__":
                     with write_locks[rollout_idx]:
                         with open(output_file, "a", encoding="utf-8") as f:
                             f.write(json.dumps(result, ensure_ascii=False) + "\n")
+                    persisted_task_ids.add(task_info["task_id"])
+                except VllmServerError as exc:
+                    abort_event.set()
+                    for pending_task in future_to_task.values():
+                        if pending_task["task_id"] in persisted_task_ids:
+                            continue
+                        cleanup_task_artifacts(pending_task)
+                    question = task_info["item"].get("question", "")
+                    hard_exit_due_to_vllm_error(
+                        "Fatal: detected vLLM server failure while processing "
+                        f"task_id={task_info['task_id']} "
+                        f"(question={question!r}, rollout={rollout_idx}): {exc}"
+                    )
                 except concurrent.futures.TimeoutError:
                     question = task_info["item"].get("question", "")
                     print(f'Timeout (>1800s): "{question}" (Rollout {rollout_idx})')
@@ -482,6 +524,7 @@ if __name__ == "__main__":
                     with write_locks[rollout_idx]:
                         with open(output_file, "a", encoding="utf-8") as f:
                             f.write(json.dumps(error_result, ensure_ascii=False) + "\n")
+                    persisted_task_ids.add(task_info["task_id"])
                 except Exception as exc:
                     question = task_info["item"].get("question", "")
                     print(f'Task for question "{question}" (Rollout {rollout_idx}) generated an exception: {exc}')
@@ -506,6 +549,7 @@ if __name__ == "__main__":
                     with write_locks[rollout_idx]:
                         with open(output_file, "a", encoding="utf-8") as f:
                             f.write(json.dumps(error_result, ensure_ascii=False) + "\n")
+                    persisted_task_ids.add(task_info["task_id"])
 
         print("\nAll tasks completed!")
 

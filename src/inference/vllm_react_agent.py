@@ -36,6 +36,11 @@ TASK_TIME_LIMIT_MINUTES = float(os.getenv("WEBEXPLORER_TASK_TIME_LIMIT_MINUTES",
 DEFAULT_NAM_MAX_MEMORY_SIZE = 32000
 DEFAULT_NAM_TRIGGER_LOW_FRAC = 0.25
 DEFAULT_NAM_TRIGGER_HIGH_FRAC = 0.75
+VLLM_SERVER_ERROR_MESSAGE = "vllm server error!!!"
+
+
+class VllmServerError(RuntimeError):
+    """Raised when the local vLLM server is unavailable after all retries."""
 
 TRUNCATED_MESSAGE = """
 --- Maximum Length Limit Reached ---
@@ -229,6 +234,9 @@ class MultiTurnReactAgent(FnCallAgent):
         model_basename = os.path.basename(str(llm["model"]).rstrip("/")).lower()
         self.is_qwen_model = "qwen" in model_basename
         self.is_deepseek_model = "deepseek" in model_basename
+        self.deepseek_max_output_tokens_cap = int(
+            os.getenv("DEEPSEEK_MAX_OUTPUT_TOKENS_CAP", "65536")
+        )
         self.context_management_strategy = normalize_context_management_strategy(
             os.getenv("CONTEXT_MANAGEMENT_STRATEGY", "none")
         )
@@ -1215,6 +1223,8 @@ Directly output the summary content without any other text."""
             )
         )
         remaining_tokens = max_input_tokens - prompt_tokens
+        if max_tokens_cap is None and self.is_deepseek_model:
+            max_tokens_cap = self.deepseek_max_output_tokens_cap
         if max_tokens_cap is not None:
             dynamic_max_tokens = min(dynamic_max_tokens, max_tokens_cap)
         print(
@@ -1371,7 +1381,11 @@ Directly output the summary content without any other text."""
             else:
                 print("Error: All retry attempts have been exhausted. The call has failed.")
 
-        return {"role": "assistant", "content": "vllm server error!!!"}
+        if env_flag("WEBEXPLORER_FAIL_FAST_ON_VLLM_ERROR", False):
+            raise VllmServerError(
+                f"vLLM server unavailable after {max_tries} attempts on port {planning_port}"
+            )
+        return {"role": "assistant", "content": VLLM_SERVER_ERROR_MESSAGE}
 
     def add_auto_judge(self, result, auto_judge, judge_engine, messages, question, answer):
         if auto_judge and answer:
