@@ -3,12 +3,15 @@ import http.client
 import time
 import random
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Union, Optional
 from qwen_agent.tools.base import BaseTool, register_tool
 import requests
 
 SERPER_API_KEY = os.environ.get('SERPER_KEY_ID', '')
+LOCAL_SEARCH_URL = os.environ.get("LOCAL_SEARCH_URL", "http://127.0.0.1:8800").rstrip("/")
 SERPER_CACHE_ENABLED = os.environ.get("SERPER_CACHE_ENABLED", "1").strip().lower() not in {
     "0", "false", "no", "off"
 }
@@ -17,6 +20,13 @@ SERPER_CACHE_PATH = os.environ.get(
     "./cache/serper_search_cache.jsonl",
 )
 _SERPER_CACHE = None
+LOCAL_SEARCH_CACHE_ENABLED = os.environ.get("LOCAL_SEARCH_CACHE_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+SEARCH_TIMING_LOG_PATH = os.environ.get("WEBEXPLORER_SEARCH_TIMING_LOG", "").strip()
+_LOCAL_SEARCH_CACHE: dict[tuple[str, int, str], str] = {}
+_LOCAL_SEARCH_CACHE_LOCK = threading.Lock()
+_SEARCH_TIMING_LOCK = threading.Lock()
 
 
 def _normalize_cache_query(query: str) -> str:
@@ -87,12 +97,70 @@ def _store_serper_cache(query: str, content: str, topk: int) -> None:
     _append_serper_cache(normalized_query, content, topk)
 
 
+def _log_search_timing(record: dict) -> None:
+    if not SEARCH_TIMING_LOG_PATH:
+        return
+    try:
+        path = Path(SEARCH_TIMING_LOG_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _SEARCH_TIMING_LOCK:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"search timing log write error: {e}", flush=True)
+
+
+def _local_cache_key(query: str, topk: int) -> tuple[str, int, str]:
+    retrieval_mode = os.environ.get("LOCAL_SEARCH_RETRIEVAL_MODE", "").strip().lower() or "hybrid"
+    return (_normalize_cache_query(query), topk, retrieval_mode)
+
+
+def _get_local_search_cache_hit(query: str, topk: int) -> Optional[str]:
+    if not LOCAL_SEARCH_CACHE_ENABLED:
+        return None
+    with _LOCAL_SEARCH_CACHE_LOCK:
+        return _LOCAL_SEARCH_CACHE.get(_local_cache_key(query, topk))
+
+
+def _store_local_search_cache(query: str, topk: int, content: str) -> None:
+    if not LOCAL_SEARCH_CACHE_ENABLED:
+        return
+    with _LOCAL_SEARCH_CACHE_LOCK:
+        _LOCAL_SEARCH_CACHE[_local_cache_key(query, topk)] = content
+
+
 def get_searches_results(queries: List[str], topk: int = 10, engine: str = "serper", max_retry: int = 3) -> str:
     """Get search results for multiple queries using specified search engine."""
-    results = []
-    for i, query in enumerate(queries):
+    max_queries = int(os.environ.get("WEBEXPLORER_SEARCH_MAX_QUERIES_PER_CALL", "8"))
+    max_workers = int(os.environ.get("WEBEXPLORER_SEARCH_MAX_WORKERS", "4"))
+    queries = [str(query) for query in queries[:max_queries]]
+    if not queries:
+        return ""
+
+    def run_one(query: str) -> str:
+        started = time.time()
         result = get_search_results(query, topk=topk, engine=engine, max_retry=max_retry)
-        # 使用与deep_research_utils.py相同的格式
+        _log_search_timing(
+            {
+                "event": "web_search_query",
+                "engine": engine,
+                "query": query,
+                "topk": topk,
+                "elapsed_s": round(time.time() - started, 4),
+                "ts": time.time(),
+            }
+        )
+        return result
+
+    if len(queries) == 1 or max_workers <= 1:
+        search_results = [run_one(query) for query in queries]
+    else:
+        worker_count = min(max_workers, len(queries))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            search_results = list(executor.map(run_one, queries))
+
+    results = []
+    for query, result in zip(queries, search_results):
         formatted_result = f"--- search result for [{query}] ---\n{result}\n--- end of search result ---"
         results.append(formatted_result)
     return "\n\n".join(results)
@@ -100,8 +168,11 @@ def get_searches_results(queries: List[str], topk: int = 10, engine: str = "serp
 
 def get_search_results(query: str, topk: int = 10, engine: str = "serper", max_retry: int = 3) -> str:
     """Get search results for a single query using specified search engine."""
+    engine = (engine or "serper").strip().lower()
     if engine == "serper":
         return google_search_with_serp(query, topk=topk, max_retry=max_retry)
+    elif engine == "local":
+        return local_search_with_service(query, topk=topk, max_retry=max_retry)
     else:
         raise ValueError(f"Unsupported search engine: {engine}")
 
@@ -174,6 +245,51 @@ def google_search_with_serp(query: str, topk: int = 10, max_retry: int = 3) -> s
     return f"Search failed after {max_retry} retries for query: '{query}'"
 
 
+def local_search_with_service(query: str, topk: int = 10, max_retry: int = 3) -> str:
+    """Search the local offline mini-Google service."""
+    cached_result = _get_local_search_cache_hit(query, topk)
+    if cached_result is not None:
+        print(f"local search cache hit: {query}", flush=True)
+        return cached_result
+
+    payload = {"query": query, "topn": topk}
+    retrieval_mode = os.environ.get("LOCAL_SEARCH_RETRIEVAL_MODE", "").strip().lower()
+    if retrieval_mode:
+        payload["mode"] = retrieval_mode
+    for retry_cnt in range(max_retry):
+        try:
+            response = requests.post(f"{LOCAL_SEARCH_URL}/search", json=payload, timeout=30)
+            response.raise_for_status()
+            results = response.json()
+            pages = results.get("results", [])
+            if not pages:
+                return f"No local offline results found for '{query}'. Try with a more general query."
+
+            web_snippets = []
+            for page in pages[:topk]:
+                snippet = page.get("summary", "")
+                if page.get("date"):
+                    snippet = f"Date published: {page['date']}\n{snippet}"
+                if page.get("source_type"):
+                    snippet = f"Source: {page['source_type']}\n{snippet}"
+                redacted_version = (
+                    f"<title>{page.get('title', '')}</title>\n"
+                    f"<url>{page.get('url', '')}</url>\n"
+                    f"<snippet>\n{snippet}\n</snippet>"
+                )
+                web_snippets.append(redacted_version)
+            content = "\n\n".join(web_snippets)
+            _store_local_search_cache(query, topk, content)
+            return content
+        except Exception as e:
+            print(f"local_search_with_service {retry_cnt} error: {e}", flush=True)
+            if retry_cnt == max_retry - 1:
+                return f"No local offline results found for '{query}'. Error: {str(e)}"
+            time.sleep(random.uniform(0.5, 2))
+
+    return f"Local offline search failed after {max_retry} retries for query: '{query}'"
+
+
 @register_tool("search", allow_overwrite=True)
 class WebExplorerSearch(BaseTool):
     name = "search"
@@ -194,7 +310,8 @@ class WebExplorerSearch(BaseTool):
 
     def __init__(self, cfg: Optional[dict] = None):
         super().__init__(cfg)
-        self.search_engine = cfg.get("search_engine", "serper") if cfg else "serper"
+        default_engine = os.environ.get("WEBEXPLORER_SEARCH_ENGINE", "serper").strip().lower()
+        self.search_engine = cfg.get("search_engine", default_engine) if cfg else default_engine
         self.topk = cfg.get("topk", 10) if cfg else 10
         self.max_retry = cfg.get("max_retry", 3) if cfg else 3
 

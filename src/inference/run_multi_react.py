@@ -14,6 +14,7 @@ from deepseek_vllm_agent import DeepSeekVllmReactAgent
 import time
 import math
 import re
+import traceback
 from typing import Dict, Optional
 
 
@@ -80,7 +81,41 @@ def remove_file_if_exists(path: str) -> None:
 
 def cleanup_task_artifacts(task_info: dict) -> None:
     remove_file_if_exists(task_info["running_path"])
-    remove_file_if_exists(task_info["finished_path"])
+    for key in ("finished_path", "to_eval_path", "errored_path", "interrupted_path"):
+        path = task_info.get(key)
+        if path:
+            remove_file_if_exists(path)
+
+
+def has_auto_judge_score(payload: dict) -> bool:
+    auto_judge = payload.get("auto_judge")
+    if not isinstance(auto_judge, dict):
+        return False
+    return isinstance(auto_judge.get("score"), (int, float))
+
+
+def is_error_result(payload: dict) -> bool:
+    if payload.get("error"):
+        return True
+    if payload.get("prediction") == "[Failed]":
+        return True
+    return False
+
+
+def is_interrupted_result(payload: dict) -> bool:
+    if payload.get("interrupted") is True:
+        return True
+    return payload.get("termination") in {"timeout", "interrupted"}
+
+
+def terminal_path_for_result(task_info: dict, payload: dict) -> str:
+    if is_interrupted_result(payload):
+        return task_info["interrupted_path"]
+    if is_error_result(payload):
+        return task_info["errored_path"]
+    if has_auto_judge_score(payload):
+        return task_info["finished_path"]
+    return task_info["to_eval_path"]
 
 
 def hard_exit_due_to_vllm_error(message: str, exit_code: int = 2) -> None:
@@ -120,9 +155,14 @@ def build_progress_writer(task_info: dict, abort_event: Optional[threading.Event
         payload["updated_at"] = now
 
         if final:
-            payload["status"] = "finished"
+            payload["status"] = "interrupted" if is_interrupted_result(payload) else "finished"
             payload["finished_at"] = now
-            write_json_atomic(task_info["finished_path"], payload)
+            terminal_path = terminal_path_for_result(task_info, payload)
+            for key in ("finished_path", "to_eval_path", "errored_path", "interrupted_path"):
+                path = task_info.get(key)
+                if path and path != terminal_path:
+                    remove_file_if_exists(path)
+            write_json_atomic(terminal_path, payload)
             try:
                 os.remove(task_info["running_path"])
             except FileNotFoundError:
@@ -158,7 +198,12 @@ def load_running_resume_state(running_path: str, question: str) -> Optional[Dict
     return state
 
 
-def collect_processed_queries(output_file: str, finished_dir: str, rollout_idx: int) -> set:
+def collect_processed_queries(
+    output_file: str,
+    finished_dir: str,
+    rollout_idx: int,
+    to_eval_dir: Optional[str] = None,
+) -> set:
     processed_queries = set()
     if os.path.exists(output_file):
         try:
@@ -173,11 +218,16 @@ def collect_processed_queries(output_file: str, finished_dir: str, rollout_idx: 
         except FileNotFoundError:
             pass
 
-    if os.path.isdir(finished_dir):
-        for filename in os.listdir(finished_dir):
+    terminal_dirs = [finished_dir]
+    if to_eval_dir:
+        terminal_dirs.append(to_eval_dir)
+    for terminal_dir in terminal_dirs:
+        if not os.path.isdir(terminal_dir):
+            continue
+        for filename in os.listdir(terminal_dir):
             if not filename.endswith(f"_iter{rollout_idx}.json"):
                 continue
-            path = os.path.join(finished_dir, filename)
+            path = os.path.join(terminal_dir, filename)
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -271,10 +321,16 @@ if __name__ == "__main__":
     dataset_dir = os.path.join(dataset_base_dir, output_tag)
     running_dir = os.path.join(dataset_dir, "running")
     finished_dir = os.path.join(dataset_dir, "finished")
+    to_eval_dir = os.path.join(dataset_dir, "to_eval")
+    errored_dir = os.path.join(dataset_dir, "errored")
+    interrupted_dir = os.path.join(dataset_dir, "interrupted")
 
     os.makedirs(dataset_dir, exist_ok=True)
     os.makedirs(running_dir, exist_ok=True)
     os.makedirs(finished_dir, exist_ok=True)
+    os.makedirs(to_eval_dir, exist_ok=True)
+    os.makedirs(errored_dir, exist_ok=True)
+    os.makedirs(interrupted_dir, exist_ok=True)
 
     print(f"Model name: {model_name}")
     print(f"Data set name: {args.dataset}")
@@ -344,6 +400,7 @@ if __name__ == "__main__":
             output_file=output_file,
             finished_dir=finished_dir,
             rollout_idx=rollout_idx,
+            to_eval_dir=to_eval_dir,
         )
         processed_queries_per_rollout[rollout_idx] = processed_queries
 
@@ -396,6 +453,9 @@ if __name__ == "__main__":
                     "output_tag": output_tag,
                     "running_path": os.path.join(running_dir, f"{task_id}.json"),
                     "finished_path": os.path.join(finished_dir, f"{task_id}.json"),
+                    "to_eval_path": os.path.join(to_eval_dir, f"{task_id}.json"),
+                    "errored_path": os.path.join(errored_dir, f"{task_id}.json"),
+                    "interrupted_path": os.path.join(interrupted_dir, f"{task_id}.json"),
                 }
                 task_info["resume_state"] = load_running_resume_state(
                     task_info["running_path"],
@@ -519,6 +579,9 @@ if __name__ == "__main__":
                         "log": [],
                         "prediction": "[Failed]",
                         "termination": "timeout",
+                        "error_type": "TimeoutError",
+                        "interrupted": True,
+                        "retryable": True,
                     }
                     task_info["progress_callback"](error_result, final=True)
                     with write_locks[rollout_idx]:
@@ -537,10 +600,13 @@ if __name__ == "__main__":
                         "task_id": task_info["task_id"],
                         "task_index": task_info["task_index"],
                         "error": f"Future resolution failed: {exc}",
+                        "error_type": type(exc).__name__,
+                        "traceback": traceback.format_exc(),
                         "messages": [],
                         "log": [],
                         "prediction": "[Failed]",
-                        "termination": "future_resolution_failed",
+                        "termination": "task_exception",
+                        "retryable": False,
                     }
                     print("===============================")
                     print(error_result)

@@ -1074,21 +1074,36 @@ Directly output the summary content without any other text."""
             tool_name = function.get("name", "")
             raw_arguments = function.get("arguments", "")
             tool_call_id = tool_call.get("id") or f"call_{int(time.time() * 1000)}_{idx}"
+            started_at = time.time()
 
             try:
                 tool_args = self._parse_tool_arguments(raw_arguments)
                 result = self.custom_call_tool(tool_name, tool_args)
+                status = "success"
+                error_type = None
             except Exception:
                 result = (
                     'Error: Tool call arguments are not valid JSON. Tool call must '
                     'contain a valid "name" and "arguments" field.'
                 )
+                status = "error"
+                error_type = "invalid_tool_arguments"
+
+            elapsed_s = time.time() - started_at
 
             tool_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call_id,
                     "content": result,
+                    "_timing": {
+                        "tool_name": tool_name,
+                        "status": status,
+                        "error_type": error_type,
+                        "elapsed_s": round(elapsed_s, 4),
+                        "started_at": started_at,
+                        "finished_at": time.time(),
+                    },
                 }
             )
 
@@ -1310,7 +1325,9 @@ Directly output the summary content without any other text."""
                     remaining_tokens=remaining_tokens,
                     max_tokens_cap=max_tokens_cap,
                 )
+                request_started_at = time.time()
                 chat_response = client.chat.completions.create(**request_kwargs)
+                request_elapsed_s = time.time() - request_started_at
                 choice = chat_response.choices[0]
                 message = choice.message
                 finish_reason = getattr(choice, "finish_reason", None)
@@ -1328,6 +1345,9 @@ Directly output the summary content without any other text."""
                     if finish_reason:
                         assistant_message["_finish_reason"] = finish_reason
                     request_info["status"] = "success"
+                    request_info["elapsed_s"] = round(request_elapsed_s, 4)
+                    request_info["started_at"] = request_started_at
+                    request_info["finished_at"] = time.time()
                     request_info["finish_reason"] = finish_reason
                     request_info["has_tool_calls"] = has_tool_calls
                     if usage:
@@ -1337,6 +1357,9 @@ Directly output the summary content without any other text."""
                     return assistant_message
 
                 request_info["status"] = "empty_response"
+                request_info["elapsed_s"] = round(request_elapsed_s, 4)
+                request_info["started_at"] = request_started_at
+                request_info["finished_at"] = time.time()
                 if request_log_callback is not None:
                     request_log_callback(request_info)
                 print(f"Warning: Attempt {attempt + 1} received an empty response.")

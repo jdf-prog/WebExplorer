@@ -208,3 +208,7 @@ __marimo__/
 /src/inference/*.pdf
 /src/inference/*.txt
 /src/inference/eval_data/vela_correct_local_none_wrong*
+/src/inference/cache
+/src/inference/logs/
+/src/inference/outputs/
+/src/inference/eval_data

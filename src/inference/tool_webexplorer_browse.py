@@ -12,6 +12,7 @@ import tiktoken
 
 
 JINA_API_KEY = os.getenv("JINA_API_KEYS", "")
+LOCAL_SEARCH_URL = os.environ.get("LOCAL_SEARCH_URL", "http://127.0.0.1:8800").rstrip("/")
 
 
 def strip_think_blocks(text: Optional[str]) -> Optional[str]:
@@ -158,9 +159,31 @@ def jina_readpage(url: str, max_retry: int = 3) -> str:
     return "[browse] Failed to read page."
 
 
+def local_readpage(url: str, max_retry: int = 3) -> str:
+    """Read page content from the local offline search service."""
+    for attempt in range(max_retry):
+        try:
+            response = requests.post(
+                f"{LOCAL_SEARCH_URL}/get_content",
+                json={"url": url},
+                timeout=30,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("content", "")
+            if response.status_code == 404:
+                return "[browse] URL not found in local offline corpus."
+            print(f"Local get_content error: {response.text}", flush=True)
+        except Exception as e:
+            print(f"local_readpage {attempt} error: {e}", flush=True)
+        time.sleep(0.5)
+    return "[browse] Failed to read local offline page."
+
+
 def get_browse_results(url: str, browse_query: str, read_engine: str = "jina", generate_engine: str = "deepseekchat", max_retry: int = 3) -> str:
     """Get browse results by reading webpage and extracting relevant information."""
     time.sleep(random.uniform(0, 16))
+    read_engine = (read_engine or "jina").strip().lower()
     
     # Read webpage content
     source_text = ""
@@ -168,6 +191,8 @@ def get_browse_results(url: str, browse_query: str, read_engine: str = "jina", g
         try:
             if read_engine == "jina":
                 source_text = jina_readpage(url, max_retry=1)
+            elif read_engine == "local" or url.startswith("offline://"):
+                source_text = local_readpage(url, max_retry=1)
             else:
                 raise ValueError(f"Unsupported read engine: {read_engine}")
             break

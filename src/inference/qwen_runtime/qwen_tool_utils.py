@@ -14,6 +14,7 @@ except ImportError:  # pragma: no cover - optional dependency in some envs
 
 
 JINA_API_KEY = os.getenv("JINA_API_KEYS", "")
+LOCAL_SEARCH_URL = os.environ.get("LOCAL_SEARCH_URL", "http://127.0.0.1:8800").rstrip("/")
 
 
 def strip_think_blocks(text: Optional[str]) -> Optional[str]:
@@ -115,6 +116,10 @@ def call_openai_compatible_model(
 
 
 def jina_readpage(url: str, max_retry: int = 3) -> str:
+    read_engine = (os.getenv("QWEN_BROWSE_READ_ENGINE") or os.getenv("BROWSE_READ_ENGINE", "jina")).strip().lower()
+    if read_engine == "local" or url.startswith("offline://"):
+        return local_readpage(url, max_retry=max_retry)
+
     if not JINA_API_KEY:
         return "[browse] JINA_API_KEYS environment variable is not set."
 
@@ -134,6 +139,26 @@ def jina_readpage(url: str, max_retry: int = 3) -> str:
         time.sleep(0.5)
 
     return "[browse] Failed to read page."
+
+
+def local_readpage(url: str, max_retry: int = 3) -> str:
+    for attempt in range(max_retry):
+        try:
+            response = requests.post(
+                f"{LOCAL_SEARCH_URL}/get_content",
+                json={"url": url},
+                timeout=30,
+            )
+            if response.status_code == 200:
+                return response.json().get("content", "")
+            if response.status_code == 404:
+                return "[browse] URL not found in local offline corpus."
+            print(f"Local get_content error: {response.text}", flush=True)
+        except Exception as exc:
+            print(f"local_readpage attempt {attempt} error: {exc}", flush=True)
+        time.sleep(0.5)
+
+    return "[browse] Failed to read local offline page."
 
 
 def split_text_by_tokens(text: str, chunk_limit: int = 95000, overlap: int = 1024):
