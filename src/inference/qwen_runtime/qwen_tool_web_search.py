@@ -163,8 +163,6 @@ def get_search_results(query: str, topk: int = 10, max_retry: int = 3, engine: s
                 snippet = page.get("snippet", "")
                 if page.get("date"):
                     snippet = f"Date published: {page['date']}\n{snippet}"
-                if page.get("source"):
-                    snippet = f"Source: {page['source']}\n{snippet}"
                 snippet = snippet.replace("Your browser can't play this video.", "")
                 snippets.append(
                     "\n".join(
@@ -215,8 +213,6 @@ def local_search_with_service(query: str, topk: int = 10, max_retry: int = 3) ->
                 snippet = page.get("summary", "")
                 if page.get("date"):
                     snippet = f"Date published: {page['date']}\n{snippet}"
-                if page.get("source_type"):
-                    snippet = f"Source: {page['source_type']}\n{snippet}"
                 snippets.append(
                     "\n".join(
                         [

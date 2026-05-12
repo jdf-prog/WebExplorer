@@ -221,10 +221,6 @@ def google_search_with_serp(query: str, topk: int = 10, max_retry: int = 3) -> s
                 if "date" in page:
                     snippet = f"Date published: {page['date']}\n{snippet}"
                 
-                # 添加来源信息到snippet中（如果有的话）
-                if "source" in page:
-                    snippet = f"Source: {page['source']}\n{snippet}"
-                
                 # 清理内容
                 snippet = snippet.replace("Your browser can't play this video.", "")
                 
@@ -270,8 +266,6 @@ def local_search_with_service(query: str, topk: int = 10, max_retry: int = 3) ->
                 snippet = page.get("summary", "")
                 if page.get("date"):
                     snippet = f"Date published: {page['date']}\n{snippet}"
-                if page.get("source_type"):
-                    snippet = f"Source: {page['source_type']}\n{snippet}"
                 redacted_version = (
                     f"<title>{page.get('title', '')}</title>\n"
                     f"<url>{page.get('url', '')}</url>\n"
