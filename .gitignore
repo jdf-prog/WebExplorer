@@ -212,3 +212,5 @@ __marimo__/
 /src/inference/logs/
 /src/inference/outputs/
 /src/inference/eval_data
+/src/inference/tmp*
+/src/inference/*html
