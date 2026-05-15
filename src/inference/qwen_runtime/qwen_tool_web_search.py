@@ -204,7 +204,13 @@ def local_search_with_service(query: str, topk: int = 10, max_retry: int = 3) ->
     for retry_cnt in range(max_retry):
         try:
             response = requests.post(f"{LOCAL_SEARCH_URL}/search", json=payload, timeout=30)
-            response.raise_for_status()
+            if not response.ok:
+                body = response.text[:500]
+                print(f"qwen local web_search retry {retry_cnt} error: {response.status_code} {response.reason} body={body}", flush=True)
+                if retry_cnt == max_retry - 1:
+                    return f"No local offline results found for '{query}'. Error: {response.status_code} {body}"
+                time.sleep(random.uniform(0.5, 2))
+                continue
             pages = response.json().get("results", [])
             if not pages:
                 return f"No local offline results found for '{query}'. Try a more general query."
@@ -217,7 +223,7 @@ def local_search_with_service(query: str, topk: int = 10, max_retry: int = 3) ->
                     "\n".join(
                         [
                             f"<title>{page.get('title', '')}</title>",
-                            f"<url>{page.get('url', '')}</url>",
+                            f"<url>{page.get('source_url') or page.get('url', '')}</url>",
                             "<snippet>",
                             snippet,
                             "</snippet>",

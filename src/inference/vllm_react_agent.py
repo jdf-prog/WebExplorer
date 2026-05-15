@@ -37,10 +37,18 @@ DEFAULT_NAM_MAX_MEMORY_SIZE = 32000
 DEFAULT_NAM_TRIGGER_LOW_FRAC = 0.25
 DEFAULT_NAM_TRIGGER_HIGH_FRAC = 0.75
 VLLM_SERVER_ERROR_MESSAGE = "vllm server error!!!"
+TOOL_CALL_REPAIR_MAX_RESAMPLES = int(
+    os.getenv("WEBEXPLORER_TOOL_CALL_REPAIR_MAX_RESAMPLES", "3")
+)
 
 
 class VllmServerError(RuntimeError):
     """Raised when the local vLLM server is unavailable after all retries."""
+
+
+class ToolCallParseError(RuntimeError):
+    """Raised when a model emits an unparseable raw tool call."""
+
 
 TRUNCATED_MESSAGE = """
 --- Maximum Length Limit Reached ---
@@ -456,6 +464,125 @@ class MultiTurnReactAgent(FnCallAgent):
                 assistant_message["tool_calls"].append(normalized_tool_call)
 
         return assistant_message
+
+    def _looks_like_raw_tool_call(self, content: Optional[str]) -> bool:
+        if not content:
+            return False
+        stripped = strip_think_blocks(content).lstrip()
+        if not stripped:
+            return False
+        raw_markers = (
+            "<｜DSML｜tool_calls",
+            "<tool_calls",
+            "<｜DSML｜invoke",
+            "<invoke",
+        )
+        return stripped.startswith(raw_markers) or any(
+            marker in stripped for marker in raw_markers[:2]
+        )
+
+    def _schema_required_params(self, tool_name: str) -> set:
+        tool = self.tool_map.get(tool_name)
+        if tool is None:
+            return set()
+        parameters = getattr(tool, "parameters", {}) or {}
+        required = parameters.get("required") or []
+        return {str(param) for param in required}
+
+    def _decode_dsml_parameter_value(self, raw_value: str, is_string: str):
+        if is_string == "true":
+            return raw_value
+        value = raw_value.strip()
+        try:
+            return json.loads(value)
+        except Exception:
+            if json5 is None:
+                raise
+            return json5.loads(value)
+
+    def _parse_raw_dsml_tool_calls(self, content: str) -> List[Dict]:
+        raw_content = strip_think_blocks(content).strip()
+        if not self._looks_like_raw_tool_call(raw_content):
+            raise ValueError("content does not look like a DSML tool-call block")
+
+        invoke_pattern = re.compile(
+            r"<(?:｜DSML｜)?invoke\s+name=\"([^\"]+)\"\s*>\s*"
+            r"(.*?)"
+            r"\s*</(?:｜DSML｜)?invoke\s*>",
+            re.DOTALL,
+        )
+        parameter_pattern = re.compile(
+            r"<(?:｜DSML｜)?parameter\s+name=\"([^\"]+)\"\s+"
+            r"string=\"(true|false)\"\s*>"
+            r"(.*?)"
+            r"</(?:｜DSML｜)?parameter\s*>",
+            re.DOTALL,
+        )
+
+        tool_calls: List[Dict] = []
+        for idx, invoke_match in enumerate(invoke_pattern.finditer(raw_content)):
+            tool_name = invoke_match.group(1).strip()
+            if tool_name not in self.tool_map:
+                raise ValueError(f"unknown tool name in DSML block: {tool_name}")
+
+            body = invoke_match.group(2)
+            param_matches = list(parameter_pattern.finditer(body))
+            if not param_matches:
+                raise ValueError(f"no DSML parameters found for tool {tool_name}")
+
+            arguments = {}
+            for param_match in param_matches:
+                param_name = param_match.group(1).strip()
+                is_string = param_match.group(2).strip().lower()
+                raw_value = param_match.group(3)
+                arguments[param_name] = self._decode_dsml_parameter_value(
+                    raw_value, is_string
+                )
+
+            missing = self._schema_required_params(tool_name) - set(arguments)
+            if missing:
+                raise ValueError(
+                    f"missing required parameters for tool {tool_name}: "
+                    f"{sorted(missing)}"
+                )
+
+            tool_calls.append(
+                {
+                    "id": f"call_repaired_{int(time.time() * 1000)}_{idx}",
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(arguments, ensure_ascii=False),
+                    },
+                }
+            )
+
+        if not tool_calls:
+            raise ValueError("no DSML invoke blocks found")
+
+        return tool_calls
+
+    def _repair_raw_tool_call_message(
+        self,
+        assistant_message: Dict,
+        *,
+        raw_content: Optional[str],
+        original_finish_reason: Optional[str],
+    ) -> bool:
+        if not raw_content:
+            raise ValueError("tool-call finish_reason without content or tool_calls")
+
+        tool_calls = self._parse_raw_dsml_tool_calls(raw_content)
+        assistant_message["content"] = ""
+        assistant_message["tool_calls"] = tool_calls
+        assistant_message["_finish_reason"] = "tool_calls"
+        assistant_message["_tool_call_repair"] = {
+            "repaired": True,
+            "source": "raw_dsml_content",
+            "original_finish_reason": original_finish_reason,
+            "tool_call_count": len(tool_calls),
+        }
+        return True
 
     def _strip_internal_message_fields(self, messages: List[Dict]) -> List[Dict]:
         return [
@@ -1281,6 +1408,9 @@ Directly output the summary content without any other text."""
                 },
             }
 
+        repair_retry_limit = max(0, TOOL_CALL_REPAIR_MAX_RESAMPLES)
+        repair_failures = 0
+
         for attempt in range(max_tries):
             try:
                 print(
@@ -1340,6 +1470,61 @@ Directly output the summary content without any other text."""
                         "--- Service call successful, received a valid response ---"
                     )
                     assistant_message = self._normalize_assistant_message(message)
+                    needs_tool_call_repair = (
+                        use_tools
+                        and not has_tool_calls
+                        and (
+                            finish_reason == "tool_calls"
+                            or self._looks_like_raw_tool_call(content)
+                        )
+                    )
+                    if needs_tool_call_repair:
+                        try:
+                            self._repair_raw_tool_call_message(
+                                assistant_message,
+                                raw_content=content,
+                                original_finish_reason=finish_reason,
+                            )
+                            has_tool_calls = True
+                            request_info["tool_call_repaired"] = True
+                            request_info["original_finish_reason"] = finish_reason
+                            finish_reason = "tool_calls"
+                            print(
+                                "Repaired raw DSML tool call from response content.",
+                                flush=True,
+                            )
+                        except Exception as repair_exc:
+                            repair_failures += 1
+                            request_info["status"] = "tool_call_parse_mismatch"
+                            request_info["elapsed_s"] = round(request_elapsed_s, 4)
+                            request_info["started_at"] = request_started_at
+                            request_info["finished_at"] = time.time()
+                            request_info["finish_reason"] = finish_reason
+                            request_info["has_tool_calls"] = False
+                            request_info["tool_call_repair_error"] = str(repair_exc)
+                            request_info["tool_call_repair_failures"] = repair_failures
+                            if usage:
+                                request_info["usage"] = copy.deepcopy(usage)
+                            if request_log_callback is not None:
+                                request_log_callback(request_info)
+
+                            if repair_failures < repair_retry_limit:
+                                sleep_time = min(1 + repair_failures, 3)
+                                print(
+                                    "Warning: raw tool-call response could not be "
+                                    f"repaired ({repair_exc}); resampling "
+                                    f"{repair_failures}/{repair_retry_limit} "
+                                    f"after {sleep_time:.2f}s.",
+                                    flush=True,
+                                )
+                                time.sleep(sleep_time)
+                                continue
+
+                            raise ToolCallParseError(
+                                "raw tool-call response could not be repaired after "
+                                f"{repair_failures} attempts: {repair_exc}"
+                            ) from repair_exc
+
                     if usage:
                         assistant_message["_usage"] = usage
                     if finish_reason:
@@ -1363,6 +1548,8 @@ Directly output the summary content without any other text."""
                 if request_log_callback is not None:
                     request_log_callback(request_info)
                 print(f"Warning: Attempt {attempt + 1} received an empty response.")
+            except ToolCallParseError:
+                raise
             except (APIError, APIConnectionError, APITimeoutError) as e:
                 if request_log_callback is not None:
                     request_log_callback(
@@ -1715,7 +1902,7 @@ Directly output the summary content without any other text."""
         return SYSTEM_PROMPT
 
     def _deepseek_reasoning_effort(self) -> Optional[str]:
-        thinking_mode = os.getenv("DEEPSEEK_THINKING_MODE", "think_max").strip().lower()
+        thinking_mode = os.getenv("DEEPSEEK_THINKING_MODE", "think").strip().lower()
         if thinking_mode in {"think", "think_high", "think-high", "high"}:
             return "high"
         if thinking_mode in {"think_max", "think-max", "max"}:

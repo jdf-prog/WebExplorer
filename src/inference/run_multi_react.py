@@ -313,7 +313,7 @@ if __name__ == "__main__":
         output_tag += f"_thr-{sanitize_tag_value(context_reset_threshold)}"
     output_tag += f"_turns-{sanitize_tag_value(max_llm_call_per_run)}"
     if is_deepseek_model(model):
-        deepseek_thinking_mode = os.getenv("DEEPSEEK_THINKING_MODE", "think_max")
+        deepseek_thinking_mode = os.getenv("DEEPSEEK_THINKING_MODE", "think")
         output_tag += f"_think-{sanitize_tag_value(deepseek_thinking_mode)}"
 
     model_dir = os.path.join(output_base, f"{model_name}")

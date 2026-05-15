@@ -268,7 +268,7 @@ def local_search_with_service(query: str, topk: int = 10, max_retry: int = 3) ->
                     snippet = f"Date published: {page['date']}\n{snippet}"
                 redacted_version = (
                     f"<title>{page.get('title', '')}</title>\n"
-                    f"<url>{page.get('url', '')}</url>\n"
+                    f"<url>{page.get('source_url') or page.get('url', '')}</url>\n"
                     f"<snippet>\n{snippet}\n</snippet>"
                 )
                 web_snippets.append(redacted_version)
