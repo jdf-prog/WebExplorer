@@ -40,6 +40,9 @@ VLLM_SERVER_ERROR_MESSAGE = "vllm server error!!!"
 TOOL_CALL_REPAIR_MAX_RESAMPLES = int(
     os.getenv("WEBEXPLORER_TOOL_CALL_REPAIR_MAX_RESAMPLES", "3")
 )
+RAW_TOOL_CALL_RESAMPLE_MAX_ATTEMPTS = int(
+    os.getenv("WEBEXPLORER_RAW_TOOL_CALL_RESAMPLES", "1")
+)
 
 
 class VllmServerError(RuntimeError):
@@ -489,7 +492,13 @@ class MultiTurnReactAgent(FnCallAgent):
                 flags=re.DOTALL,
             ):
                 return True
-        return False
+        return bool(
+            re.search(
+                r"<function>\s*([A-Za-z_][\w]*)\s*,\s*.*?</function>",
+                stripped,
+                flags=re.DOTALL,
+            )
+        )
 
     def _schema_required_params(self, tool_name: str) -> set:
         tool = self.tool_map.get(tool_name)
@@ -718,6 +727,63 @@ class MultiTurnReactAgent(FnCallAgent):
 
         return tool_calls
 
+    def _parse_raw_legacy_function_tool_calls(self, content: str) -> List[Dict]:
+        raw_content = strip_think_blocks(content).strip()
+        function_pattern = re.compile(
+            r"<function>\s*(.*?)\s*</function>",
+            re.DOTALL,
+        )
+        tool_calls: List[Dict] = []
+
+        for idx, function_match in enumerate(function_pattern.finditer(raw_content)):
+            body = function_match.group(1).strip()
+            call_match = re.match(
+                r"([A-Za-z_][\w]*)\s*,\s*(.*)\Z",
+                body,
+                flags=re.DOTALL,
+            )
+            if not call_match:
+                continue
+
+            tool_name = call_match.group(1).strip()
+            if tool_name not in self.tool_map:
+                continue
+
+            raw_arguments = call_match.group(2).strip()
+            try:
+                arguments = json.loads(raw_arguments)
+            except Exception:
+                if json5 is None:
+                    raise
+                arguments = json5.loads(raw_arguments)
+            if not isinstance(arguments, dict):
+                raise ValueError(
+                    f"legacy function arguments for tool {tool_name} are not an object"
+                )
+
+            missing = self._schema_required_params(tool_name) - set(arguments)
+            if missing:
+                raise ValueError(
+                    f"missing required parameters for legacy function tool {tool_name}: "
+                    f"{sorted(missing)}"
+                )
+
+            tool_calls.append(
+                {
+                    "id": f"call_repaired_{int(time.time() * 1000)}_function_{idx}",
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(arguments, ensure_ascii=False),
+                    },
+                }
+            )
+
+        if not tool_calls:
+            raise ValueError("no legacy function tool-call blocks found")
+
+        return tool_calls
+
     def _parse_raw_tool_calls(self, content: str) -> tuple[List[Dict], str]:
         try:
             return self._parse_raw_dsml_tool_calls(content), "raw_dsml_content"
@@ -727,10 +793,17 @@ class MultiTurnReactAgent(FnCallAgent):
                     self._parse_raw_legacy_xml_tool_calls(content),
                     "raw_legacy_xml_content",
                 )
-            except ValueError as legacy_exc:
-                raise ValueError(
-                    f"{dsml_exc}; legacy XML parse failed: {legacy_exc}"
-                ) from legacy_exc
+            except ValueError as legacy_xml_exc:
+                try:
+                    return (
+                        self._parse_raw_legacy_function_tool_calls(content),
+                        "raw_legacy_function_content",
+                    )
+                except ValueError as legacy_function_exc:
+                    raise ValueError(
+                        f"{dsml_exc}; legacy XML parse failed: {legacy_xml_exc}; "
+                        f"legacy function parse failed: {legacy_function_exc}"
+                    ) from legacy_function_exc
 
     def _repair_raw_tool_call_message(
         self,
@@ -1580,6 +1653,8 @@ Directly output the summary content without any other text."""
 
         repair_retry_limit = max(0, TOOL_CALL_REPAIR_MAX_RESAMPLES)
         repair_failures = 0
+        raw_tool_call_resample_limit = max(0, RAW_TOOL_CALL_RESAMPLE_MAX_ATTEMPTS)
+        raw_tool_call_resamples = 0
 
         for attempt in range(max_tries):
             try:
@@ -1649,6 +1724,34 @@ Directly output the summary content without any other text."""
                         )
                     )
                     if needs_tool_call_repair:
+                        if raw_tool_call_resamples < raw_tool_call_resample_limit:
+                            raw_tool_call_resamples += 1
+                            request_info["status"] = "raw_tool_call_resample"
+                            request_info["elapsed_s"] = round(request_elapsed_s, 4)
+                            request_info["started_at"] = request_started_at
+                            request_info["finished_at"] = time.time()
+                            request_info["finish_reason"] = finish_reason
+                            request_info["has_tool_calls"] = False
+                            request_info["raw_tool_call_resamples"] = (
+                                raw_tool_call_resamples
+                            )
+                            request_info["raw_tool_call_resample_limit"] = (
+                                raw_tool_call_resample_limit
+                            )
+                            if usage:
+                                request_info["usage"] = copy.deepcopy(usage)
+                            if request_log_callback is not None:
+                                request_log_callback(request_info)
+                            print(
+                                "Warning: raw tool-call text was returned without "
+                                "structured tool_calls; resampling "
+                                f"{raw_tool_call_resamples}/"
+                                f"{raw_tool_call_resample_limit} before repair.",
+                                flush=True,
+                            )
+                            time.sleep(min(0.5 * raw_tool_call_resamples, 2.0))
+                            continue
+
                         try:
                             self._repair_raw_tool_call_message(
                                 assistant_message,
