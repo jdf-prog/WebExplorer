@@ -477,9 +477,19 @@ class MultiTurnReactAgent(FnCallAgent):
             "<｜DSML｜invoke",
             "<invoke",
         )
-        return stripped.startswith(raw_markers) or any(
+        if stripped.startswith(raw_markers) or any(
             marker in stripped for marker in raw_markers[:2]
-        )
+        ):
+            return True
+
+        for tool_name in self.tool_map:
+            if re.search(
+                rf"<{re.escape(tool_name)}\b[^>]*>.*?</{re.escape(tool_name)}>",
+                stripped,
+                flags=re.DOTALL,
+            ):
+                return True
+        return False
 
     def _schema_required_params(self, tool_name: str) -> set:
         tool = self.tool_map.get(tool_name)
@@ -502,7 +512,16 @@ class MultiTurnReactAgent(FnCallAgent):
 
     def _parse_raw_dsml_tool_calls(self, content: str) -> List[Dict]:
         raw_content = strip_think_blocks(content).strip()
-        if not self._looks_like_raw_tool_call(raw_content):
+        raw_markers = (
+            "<｜DSML｜tool_calls",
+            "<tool_calls",
+            "<｜DSML｜invoke",
+            "<invoke",
+        )
+        if not (
+            raw_content.lstrip().startswith(raw_markers)
+            or any(marker in raw_content for marker in raw_markers[:2])
+        ):
             raise ValueError("content does not look like a DSML tool-call block")
 
         invoke_pattern = re.compile(
@@ -562,6 +581,157 @@ class MultiTurnReactAgent(FnCallAgent):
 
         return tool_calls
 
+    def _decode_legacy_parameter_value(self, raw_value: str, schema: Dict):
+        value = raw_value.strip()
+        if not value:
+            return value
+
+        try:
+            return json.loads(value)
+        except Exception:
+            if json5 is not None:
+                try:
+                    return json5.loads(value)
+                except Exception:
+                    pass
+
+        if schema.get("type") == "array":
+            return [value]
+        return value
+
+    def _legacy_parameter_tag_names(self, param_name: str) -> List[str]:
+        tag_names = [param_name]
+        if param_name.endswith("ies") and len(param_name) > 3:
+            tag_names.append(param_name[:-3] + "y")
+        elif param_name.endswith("s") and len(param_name) > 1:
+            tag_names.append(param_name[:-1])
+        return tag_names
+
+    def _parse_raw_legacy_xml_tool_calls(self, content: str) -> List[Dict]:
+        raw_content = strip_think_blocks(content).strip()
+        tool_calls: List[Dict] = []
+
+        for tool_idx, tool_name in enumerate(self.tool_map):
+            tool_pattern = re.compile(
+                rf"<{re.escape(tool_name)}\b[^>]*>\s*"
+                rf"(.*?)"
+                rf"\s*</{re.escape(tool_name)}>",
+                re.DOTALL,
+            )
+            for match_idx, tool_match in enumerate(tool_pattern.finditer(raw_content)):
+                body = tool_match.group(1).strip()
+                tool = self.tool_map[tool_name]
+                parameters = getattr(tool, "parameters", {}) or {}
+                properties = parameters.get("properties") or {}
+                arguments = {}
+
+                if body.startswith("{"):
+                    try:
+                        parsed_body = json.loads(body)
+                    except Exception:
+                        if json5 is None:
+                            raise
+                        parsed_body = json5.loads(body)
+                    if not isinstance(parsed_body, dict):
+                        raise ValueError(
+                            f"legacy XML body for tool {tool_name} is not an object"
+                        )
+                    arguments.update(parsed_body)
+
+                for param_name, param_schema in properties.items():
+                    schema = param_schema if isinstance(param_schema, dict) else {}
+                    for tag_name in self._legacy_parameter_tag_names(param_name):
+                        param_pattern = re.compile(
+                            rf"<{re.escape(tag_name)}\b[^>]*>\s*"
+                            rf"(.*?)"
+                            rf"\s*</{re.escape(tag_name)}>",
+                            re.DOTALL,
+                        )
+                        param_matches = list(param_pattern.finditer(body))
+                        if not param_matches:
+                            continue
+
+                        decoded_values = [
+                            self._decode_legacy_parameter_value(
+                                param_match.group(1),
+                                schema,
+                            )
+                            for param_match in param_matches
+                        ]
+                        if schema.get("type") == "array":
+                            values = []
+                            for decoded_value in decoded_values:
+                                if isinstance(decoded_value, list):
+                                    values.extend(decoded_value)
+                                else:
+                                    values.append(decoded_value)
+                            arguments[param_name] = values
+                        else:
+                            arguments[param_name] = decoded_values[0]
+                        break
+
+                for param_name, param_schema in properties.items():
+                    if param_name in arguments:
+                        continue
+                    schema = param_schema if isinstance(param_schema, dict) else {}
+                    for alias in self._legacy_parameter_tag_names(param_name)[1:]:
+                        if alias not in arguments:
+                            continue
+                        value = arguments[alias]
+                        if schema.get("type") == "array" and not isinstance(value, list):
+                            value = [value]
+                        arguments[param_name] = value
+                        break
+
+                required = self._schema_required_params(tool_name)
+                if not arguments and len(required) == 1 and body:
+                    only_param = next(iter(required))
+                    param_schema = properties.get(only_param, {})
+                    arguments[only_param] = self._decode_legacy_parameter_value(
+                        body,
+                        param_schema if isinstance(param_schema, dict) else {},
+                    )
+
+                missing = required - set(arguments)
+                if missing:
+                    raise ValueError(
+                        f"missing required parameters for legacy XML tool {tool_name}: "
+                        f"{sorted(missing)}"
+                    )
+
+                tool_calls.append(
+                    {
+                        "id": (
+                            f"call_repaired_{int(time.time() * 1000)}_"
+                            f"{tool_idx}_{match_idx}"
+                        ),
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(arguments, ensure_ascii=False),
+                        },
+                    }
+                )
+
+        if not tool_calls:
+            raise ValueError("no legacy XML tool-call blocks found")
+
+        return tool_calls
+
+    def _parse_raw_tool_calls(self, content: str) -> tuple[List[Dict], str]:
+        try:
+            return self._parse_raw_dsml_tool_calls(content), "raw_dsml_content"
+        except ValueError as dsml_exc:
+            try:
+                return (
+                    self._parse_raw_legacy_xml_tool_calls(content),
+                    "raw_legacy_xml_content",
+                )
+            except ValueError as legacy_exc:
+                raise ValueError(
+                    f"{dsml_exc}; legacy XML parse failed: {legacy_exc}"
+                ) from legacy_exc
+
     def _repair_raw_tool_call_message(
         self,
         assistant_message: Dict,
@@ -572,13 +742,13 @@ class MultiTurnReactAgent(FnCallAgent):
         if not raw_content:
             raise ValueError("tool-call finish_reason without content or tool_calls")
 
-        tool_calls = self._parse_raw_dsml_tool_calls(raw_content)
+        tool_calls, repair_source = self._parse_raw_tool_calls(raw_content)
         assistant_message["content"] = ""
         assistant_message["tool_calls"] = tool_calls
         assistant_message["_finish_reason"] = "tool_calls"
         assistant_message["_tool_call_repair"] = {
             "repaired": True,
-            "source": "raw_dsml_content",
+            "source": repair_source,
             "original_finish_reason": original_finish_reason,
             "tool_call_count": len(tool_calls),
         }
@@ -1490,7 +1660,7 @@ Directly output the summary content without any other text."""
                             request_info["original_finish_reason"] = finish_reason
                             finish_reason = "tool_calls"
                             print(
-                                "Repaired raw DSML tool call from response content.",
+                                "Repaired raw tool call from response content.",
                                 flush=True,
                             )
                         except Exception as repair_exc:
