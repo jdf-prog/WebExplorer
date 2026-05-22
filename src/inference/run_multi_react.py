@@ -22,6 +22,16 @@ def sanitize_tag_value(value: str) -> str:
     return str(value).strip().replace(".", "p").replace("/", "-").replace(" ", "_")
 
 
+def format_context_length_tag(value: str) -> str:
+    try:
+        tokens = int(value)
+    except (TypeError, ValueError):
+        return sanitize_tag_value(value)
+    if tokens > 0 and tokens % 1024 == 0:
+        return f"{tokens // 1024}k"
+    return sanitize_tag_value(tokens)
+
+
 def sanitize_file_stem(value: str) -> str:
     sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip())
     sanitized = sanitized.strip("._")
@@ -284,14 +294,19 @@ if __name__ == "__main__":
     discard_history_max_rounds = os.getenv("DISCARD_HISTORY_MAX_ROUNDS", "0")
     if is_deepseek_model(model):
         default_max_llm_call_per_run = "500"
+        default_max_input_tokens = "131072"
     elif is_qwen_model(model):
         default_max_llm_call_per_run = "200"
+        default_max_input_tokens = "262144"
     else:
         default_max_llm_call_per_run = "100"
+        default_max_input_tokens = "196608"
     max_llm_call_per_run = os.getenv(
         "MAX_LLM_CALL_PER_RUN", default_max_llm_call_per_run
     )
+    max_input_tokens = os.getenv("MAX_INPUT_TOKENS", default_max_input_tokens)
     output_tag = f"ctx-{sanitize_tag_value(context_strategy)}"
+    output_tag += f"_maxctx-{format_context_length_tag(max_input_tokens)}"
     if context_strategy == "summary":
         output_tag += (
             f"_sumctx-{sanitize_tag_value(context_summary_trigger_tokens)}"
@@ -476,16 +491,10 @@ if __name__ == "__main__":
     if not tasks_to_run_all:
         print("All rollouts have been completed and no execution is required.")
     else:
-        if is_deepseek_model(model):
-            default_max_input_tokens = "524288"
-        elif is_qwen_model(model):
-            default_max_input_tokens = "262144"
-        else:
-            default_max_input_tokens = "196608"
         llm_cfg = {
             'model': model,
             'generate_cfg': {
-                'max_input_tokens': int(os.getenv("MAX_INPUT_TOKENS", default_max_input_tokens)),
+                'max_input_tokens': int(max_input_tokens),
                 'max_retries': 10,
                 'temperature': args.temperature,
                 'top_p': args.top_p,

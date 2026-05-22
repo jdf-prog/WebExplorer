@@ -1,8 +1,10 @@
 import copy
+import importlib.util
 import json
 import os
 import random
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -141,6 +143,13 @@ def normalize_context_management_strategy(strategy: str) -> str:
     return "none"
 
 
+def normalize_model_server_backend(backend: str) -> str:
+    normalized = (backend or "auto").strip().lower().replace("-", "_")
+    if normalized in {"vllm", "sglang"}:
+        return normalized
+    return "auto"
+
+
 def env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -251,6 +260,9 @@ class MultiTurnReactAgent(FnCallAgent):
         self.context_management_strategy = normalize_context_management_strategy(
             os.getenv("CONTEXT_MANAGEMENT_STRATEGY", "none")
         )
+        self.model_server_backend = normalize_model_server_backend(
+            os.getenv("MODEL_SERVER_BACKEND", "auto")
+        )
         self.context_reset_threshold = float(os.getenv("CONTEXT_RESET_THRESHOLD", "0.3"))
         keep_system_default = "1" if self.is_deepseek_model else "0"
         self.discard_all_keep_system_prompt = os.getenv(
@@ -293,6 +305,12 @@ class MultiTurnReactAgent(FnCallAgent):
         )
         self.tokenizer = None
         self._tokenizer_initialized = False
+        self._vllm_dsv4_encoding = None
+        self._vllm_dsv4_encoding_initialized = False
+        self._sglang_dsv4_encoding = None
+        self._sglang_dsv4_encoding_initialized = False
+        self._token_count_warning_keys = set()
+        self._last_token_count_method = "unknown"
         self._get_tokenizer()
         self.tool_instances = self._resolve_tool_instances(function_list)
         self.tool_map = {tool.name: tool for tool in self.tool_instances}
@@ -398,6 +416,170 @@ class MultiTurnReactAgent(FnCallAgent):
             self.tokenizer = None
 
         return self.tokenizer
+
+    def _warn_token_count_once(self, key: str, message: str) -> None:
+        if key in self._token_count_warning_keys:
+            return
+        self._token_count_warning_keys.add(key)
+        print(f"Warning: {message}", flush=True)
+
+    def _is_deepseek_v4_model(self) -> bool:
+        model_id = " ".join(
+            str(value)
+            for value in (
+                self.llm_local_path,
+                getattr(self, "model", ""),
+            )
+            if value
+        ).lower()
+        return self.is_deepseek_model and "v4" in model_id
+
+    def _load_module_from_path(self, module_name: str, path: Path):
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _get_vllm_dsv4_encoding(self):
+        if self._vllm_dsv4_encoding_initialized:
+            return self._vllm_dsv4_encoding
+
+        self._vllm_dsv4_encoding_initialized = True
+        candidates = []
+        for path_item in sys.path:
+            if not path_item:
+                continue
+            candidates.append(
+                Path(path_item) / "vllm/tokenizers/deepseek_v4_encoding.py"
+            )
+
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            try:
+                self._vllm_dsv4_encoding = self._load_module_from_path(
+                    "_webexplorer_vllm_deepseek_v4_encoding",
+                    candidate,
+                )
+                if self._vllm_dsv4_encoding is not None:
+                    return self._vllm_dsv4_encoding
+            except Exception as exc:
+                self._warn_token_count_once(
+                    "vllm_dsv4_encoding_load",
+                    f"failed to load vLLM DeepSeek-V4 encoder from {candidate}: {exc}",
+                )
+
+        return None
+
+    def _get_sglang_dsv4_encoding(self):
+        if self._sglang_dsv4_encoding_initialized:
+            return self._sglang_dsv4_encoding
+
+        self._sglang_dsv4_encoding_initialized = True
+        repo_root = Path(__file__).resolve().parents[3]
+        candidates = []
+        for path_item in sys.path:
+            if not path_item:
+                continue
+            candidates.append(
+                Path(path_item) / "sglang/srt/entrypoints/openai/encoding_dsv4.py"
+            )
+        candidates.append(
+            repo_root
+            / "sglang/python/sglang/srt/entrypoints/openai/encoding_dsv4.py"
+        )
+
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            try:
+                self._sglang_dsv4_encoding = self._load_module_from_path(
+                    "_webexplorer_sglang_deepseek_v4_encoding",
+                    candidate,
+                )
+                if self._sglang_dsv4_encoding is not None:
+                    return self._sglang_dsv4_encoding
+            except Exception as exc:
+                self._warn_token_count_once(
+                    "sglang_dsv4_encoding_load",
+                    f"failed to load SGLang DeepSeek-V4 encoder from {candidate}: {exc}",
+                )
+
+        return None
+
+    def _deepseek_thinking_mode_for_template(self) -> str:
+        return "thinking" if self._deepseek_reasoning_effort() is not None else "chat"
+
+    def _prepare_messages_for_dsv4_count(
+        self,
+        backend: str,
+        messages: List[Dict],
+        include_tools: bool,
+    ) -> List[Dict]:
+        prepared_messages = self._prepare_messages_for_api(messages)
+
+        if backend == "vllm":
+            if include_tools and self.tool_schemas:
+                prepared_messages.insert(
+                    0,
+                    {
+                        "role": "system",
+                        "tools": copy.deepcopy(self.tool_schemas),
+                    },
+                )
+            return prepared_messages
+
+        if not prepared_messages or prepared_messages[0].get("role") != "system":
+            prepared_messages.insert(0, {"role": "system", "content": ""})
+        if include_tools and self.tool_schemas:
+            prepared_messages[0]["tools"] = copy.deepcopy(self.tool_schemas)
+        return prepared_messages
+
+    def _count_tokens_with_backend_template(
+        self,
+        messages: List[Dict],
+        include_tools: bool,
+    ) -> Optional[tuple[int, str]]:
+        if not self._is_deepseek_v4_model():
+            return None
+        if self.model_server_backend not in {"vllm", "sglang"}:
+            return None
+
+        encoding_module = (
+            self._get_vllm_dsv4_encoding()
+            if self.model_server_backend == "vllm"
+            else self._get_sglang_dsv4_encoding()
+        )
+        tokenizer = self._get_tokenizer()
+        if encoding_module is None or tokenizer is None:
+            return None
+
+        try:
+            prompt = encoding_module.encode_messages(
+                self._prepare_messages_for_dsv4_count(
+                    self.model_server_backend,
+                    messages,
+                    include_tools,
+                ),
+                thinking_mode=self._deepseek_thinking_mode_for_template(),
+                reasoning_effort=self._deepseek_reasoning_effort(),
+            )
+            if self.model_server_backend == "vllm":
+                token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+            else:
+                token_ids = tokenizer.encode(prompt)
+            return len(token_ids), f"{self.model_server_backend}_dsv4_encoding"
+        except Exception as exc:
+            self._warn_token_count_once(
+                f"{self.model_server_backend}_dsv4_count",
+                (
+                    f"{self.model_server_backend} DeepSeek-V4 token count failed; "
+                    f"falling back to generic tokenizer path: {exc}"
+                ),
+            )
+            return None
 
     def sanity_check_output(self, content):
         return "<think>" in content and "</think>" in content
@@ -848,6 +1030,16 @@ class MultiTurnReactAgent(FnCallAgent):
         elif isinstance(thinking_payload, str):
             message["reasoning_content"] = thinking_payload
 
+    def _adapt_reasoning_fields_for_backend(self, message: Dict) -> None:
+        if message.get("role") != "assistant":
+            return
+        if self.model_server_backend != "vllm":
+            return
+
+        reasoning_content = message.get("reasoning_content")
+        if reasoning_content not in (None, "") and not message.get("reasoning"):
+            message["reasoning"] = reasoning_content
+
     def _normalize_usage(self, usage) -> Optional[Dict]:
         if usage is None:
             return None
@@ -880,13 +1072,28 @@ class MultiTurnReactAgent(FnCallAgent):
 
         return None, None
 
-    def _get_context_token_count(self, messages, usage: Optional[Dict] = None):
-        token_count, token_count_source = self._token_count_from_usage(usage)
-        if token_count is not None:
-            return token_count, token_count_source, usage
+    def _get_context_token_count(
+        self,
+        messages,
+        usage: Optional[Dict] = None,
+        prefer_usage: bool = True,
+    ):
+        if prefer_usage:
+            token_count, token_count_source = self._token_count_from_usage(usage)
+            if token_count is not None:
+                return token_count, token_count_source, usage
 
         token_count = self.count_tokens(messages)
-        return token_count, "local_count_tokens", usage
+        return (
+            token_count,
+            f"local_count_tokens.{self._last_token_count_method}",
+            {
+                "prompt_tokens": token_count,
+                "completion_tokens": 0,
+                "total_tokens": token_count,
+                "estimated": True,
+            },
+        )
 
     def _count_text_tokens(self, text: str, model: str = "gpt-4o") -> int:
         if not text:
@@ -971,6 +1178,8 @@ class MultiTurnReactAgent(FnCallAgent):
         )
         return {
             "context_management_strategy": self.context_management_strategy,
+            "model_server_backend": self.model_server_backend,
+            "last_local_token_count_method": self._last_token_count_method,
             "context_management_count": len(context_events),
             "discard_all_count": discard_all_count,
             "summary_count": summary_count,
@@ -1353,6 +1562,7 @@ Directly output the summary content without any other text."""
 
         for message in api_messages:
             self._move_thinking_to_reasoning_content(message)
+            self._adapt_reasoning_fields_for_backend(message)
 
         for message in api_messages:
             if message.get("role") != "assistant":
@@ -1404,6 +1614,7 @@ Directly output the summary content without any other text."""
 
         for message in template_messages:
             self._move_thinking_to_reasoning_content(message)
+            self._adapt_reasoning_fields_for_backend(message)
 
         for message in template_messages:
             if message.get("role") != "assistant":
@@ -1518,6 +1729,7 @@ Directly output the summary content without any other text."""
     def _configured_sampling_params(self) -> Dict:
         sampling_params = {
             "model": self.model,
+            "model_server_backend": self.model_server_backend,
             "max_input_tokens": int(
                 self.llm_generate_cfg.get("max_input_tokens", 196608)
             ),
@@ -1564,6 +1776,7 @@ Directly output the summary content without any other text."""
             "attempt": attempt,
             "max_tries": max_tries,
             "model": request_kwargs.get("model", self.model),
+            "model_server_backend": self.model_server_backend,
             "temperature": request_kwargs.get("temperature"),
             "top_p": request_kwargs.get("top_p"),
             "logprobs": request_kwargs.get("logprobs"),
@@ -1896,6 +2109,15 @@ Directly output the summary content without any other text."""
         return result
 
     def count_tokens(self, messages, model="gpt-4o", include_tools=True):
+        backend_count = self._count_tokens_with_backend_template(
+            messages,
+            include_tools=include_tools,
+        )
+        if backend_count is not None:
+            token_count, method = backend_count
+            self._last_token_count_method = method
+            return token_count
+
         tokenizer = self._get_tokenizer()
         if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
             try:
@@ -1908,16 +2130,22 @@ Directly output the summary content without any other text."""
                 if hasattr(tokenized, "keys") and "input_ids" in tokenized:
                     input_ids = tokenized["input_ids"]
                     if hasattr(input_ids, "shape"):
+                        self._last_token_count_method = "hf_apply_chat_template"
                         return int(input_ids.shape[-1])
                     try:
                         first_item = input_ids[0]
                     except (IndexError, TypeError):
+                        self._last_token_count_method = "hf_apply_chat_template"
                         return len(input_ids)
                     if isinstance(first_item, (list, tuple)):
+                        self._last_token_count_method = "hf_apply_chat_template"
                         return len(first_item)
                     if hasattr(first_item, "shape"):
+                        self._last_token_count_method = "hf_apply_chat_template"
                         return int(first_item.shape[-1])
+                    self._last_token_count_method = "hf_apply_chat_template"
                     return len(input_ids)
+                self._last_token_count_method = "hf_apply_chat_template"
                 return len(tokenized)
             except Exception as e:
                 print(f"Warning: tokenizer.apply_chat_template failed, fallback to tiktoken: {e}")
@@ -1929,6 +2157,7 @@ Directly output the summary content without any other text."""
             token_payload["tools"] = self.tool_schemas
 
         encoding = tiktoken.encoding_for_model(model)
+        self._last_token_count_method = "tiktoken_json_payload"
         return len(encoding.encode(json.dumps(token_payload, ensure_ascii=False)))
 
     def _get_dynamic_max_tokens(
@@ -1988,7 +2217,8 @@ Directly output the summary content without any other text."""
 
         token_count, token_count_source, token_usage = self._get_context_token_count(
             evaluation_messages,
-            usage=None if evaluation_messages is not messages else usage,
+            usage=None,
+            prefer_usage=False,
         )
         reset_info = {
             "strategy": self.context_management_strategy,
@@ -2636,7 +2866,8 @@ Directly output the summary content without any other text."""
                 token_count_messages = self._prepare_inference_messages(messages)
                 token_count, token_count_source, _ = self._get_context_token_count(
                     token_count_messages,
-                    usage=None if token_count_messages is not messages else latest_usage,
+                    usage=None,
+                    prefer_usage=False,
                 )
             print(
                 f"round: {round}, token count: {token_count}, "
@@ -2691,11 +2922,8 @@ Directly output the summary content without any other text."""
         prediction = self._latest_assistant_content(messages) or strip_think_blocks(
             messages[-1].get("content", "")
         )
-        if termination != "no_tool_call":
-            if num_llm_calls_available <= 0:
-                termination = "exceed_llm_calls"
-            else:
-                termination = "unknown"
+        if termination == "unknown" and num_llm_calls_available <= 0:
+            termination = "exceed_llm_calls"
         return finalize_result(prediction, termination)
 
     def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs):
