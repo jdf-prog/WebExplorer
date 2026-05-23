@@ -32,6 +32,16 @@ def format_context_length_tag(value: str) -> str:
     return sanitize_tag_value(tokens)
 
 
+def format_turns_tag(value: str) -> str:
+    try:
+        turns = int(value)
+    except (TypeError, ValueError):
+        return sanitize_tag_value(value)
+    if turns < 0:
+        return "unlimited"
+    return sanitize_tag_value(turns)
+
+
 def sanitize_file_stem(value: str) -> str:
     sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip())
     sanitized = sanitized.strip("._")
@@ -326,7 +336,7 @@ if __name__ == "__main__":
             )
     else:
         output_tag += f"_thr-{sanitize_tag_value(context_reset_threshold)}"
-    output_tag += f"_turns-{sanitize_tag_value(max_llm_call_per_run)}"
+    output_tag += f"_turns-{format_turns_tag(max_llm_call_per_run)}"
     if is_deepseek_model(model):
         deepseek_thinking_mode = os.getenv("DEEPSEEK_THINKING_MODE", "think")
         output_tag += f"_think-{sanitize_tag_value(deepseek_thinking_mode)}"

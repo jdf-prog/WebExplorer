@@ -1229,6 +1229,10 @@ class MultiTurnReactAgent(FnCallAgent):
             return 200
         return MAX_LLM_CALL_PER_RUN
 
+    @staticmethod
+    def _is_unlimited_llm_call_budget(num_llm_calls_available: int) -> bool:
+        return num_llm_calls_available < 0
+
     def _latest_assistant_content(self, messages: List[Dict]) -> str:
         for message in reversed(messages):
             if message.get("role") == "assistant" and message.get("content"):
@@ -2471,7 +2475,8 @@ Directly output the summary content without any other text."""
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": question},
         ]
-        num_llm_calls_available = self._max_llm_calls_per_run()
+        max_llm_calls_per_run = self._max_llm_calls_per_run()
+        num_llm_calls_available = max_llm_calls_per_run
         round = 0
         termination = "unknown"
         context_fold_trigger_step = None
@@ -2491,7 +2496,10 @@ Directly output the summary content without any other text."""
             if isinstance(remaining_calls, int):
                 num_llm_calls_available = remaining_calls
             else:
-                num_llm_calls_available = max(0, self._max_llm_calls_per_run() - round)
+                if self._is_unlimited_llm_call_budget(max_llm_calls_per_run):
+                    num_llm_calls_available = max_llm_calls_per_run
+                else:
+                    num_llm_calls_available = max(0, max_llm_calls_per_run - round)
             context_fold_trigger_step = resume_state.get("context_fold_trigger_step")
             context_reset_events = copy.deepcopy(
                 resume_state.get("context_reset_events") or []
@@ -2599,7 +2607,10 @@ Directly output the summary content without any other text."""
         )
 
         per_task_time_limit_seconds = task_time_limit_seconds()
-        while num_llm_calls_available > 0:
+        while (
+            self._is_unlimited_llm_call_budget(num_llm_calls_available)
+            or num_llm_calls_available > 0
+        ):
             if (
                 per_task_time_limit_seconds is not None
                 and time.time() - start_time > per_task_time_limit_seconds
@@ -2617,7 +2628,8 @@ Directly output the summary content without any other text."""
                     pending_summary_for_thinking = None
 
             round += 1
-            num_llm_calls_available -= 1
+            if not self._is_unlimited_llm_call_budget(num_llm_calls_available):
+                num_llm_calls_available -= 1
             inference_messages = self._prepare_inference_messages(messages)
             if context_fold_trigger_step is None and inference_messages is not messages:
                 for message in inference_messages:
@@ -2686,7 +2698,10 @@ Directly output the summary content without any other text."""
                 )
                 break
 
-            if num_llm_calls_available <= 0:
+            if (
+                not self._is_unlimited_llm_call_budget(num_llm_calls_available)
+                and num_llm_calls_available <= 0
+            ):
                 messages.append({"role": "user", "content": FINAL_MESSAGE})
                 final_inference_messages = self._prepare_inference_messages(messages)
                 final_request_messages = self._with_context_awareness(
@@ -2770,7 +2785,10 @@ Directly output the summary content without any other text."""
                 )
                 continue
             if context_action == "summary":
-                if num_llm_calls_available <= 0:
+                if (
+                    not self._is_unlimited_llm_call_budget(num_llm_calls_available)
+                    and num_llm_calls_available <= 0
+                ):
                     print(
                         "context management: skipping summary because there is not "
                         "enough remaining LLM-call budget",
@@ -2922,7 +2940,11 @@ Directly output the summary content without any other text."""
         prediction = self._latest_assistant_content(messages) or strip_think_blocks(
             messages[-1].get("content", "")
         )
-        if termination == "unknown" and num_llm_calls_available <= 0:
+        if (
+            termination == "unknown"
+            and not self._is_unlimited_llm_call_budget(num_llm_calls_available)
+            and num_llm_calls_available <= 0
+        ):
             termination = "exceed_llm_calls"
         return finalize_result(prediction, termination)
 

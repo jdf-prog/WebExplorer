@@ -28,6 +28,10 @@ OBS_END = '\n</tool_response>'
 MAX_LLM_CALL_PER_RUN = int(os.getenv('MAX_LLM_CALL_PER_RUN', 100))
 TASK_TIME_LIMIT_MINUTES = float(os.getenv("WEBEXPLORER_TASK_TIME_LIMIT_MINUTES", "150"))
 
+
+def is_unlimited_llm_call_budget(num_llm_calls_available: int) -> bool:
+    return num_llm_calls_available < 0
+
 TRUNCATED_MESSAGE = """
 --- Maximum Length Limit Reached ---
 You have reached the maximum length limit. 
@@ -208,7 +212,10 @@ class MultiTurnReactAgent(FnCallAgent):
         round = 0
         context_reset_events = []
         per_task_time_limit_seconds = task_time_limit_seconds()
-        while num_llm_calls_available > 0:
+        while (
+            is_unlimited_llm_call_budget(num_llm_calls_available)
+            or num_llm_calls_available > 0
+        ):
             if (
                 per_task_time_limit_seconds is not None
                 and time.time() - start_time > per_task_time_limit_seconds
@@ -228,7 +235,8 @@ class MultiTurnReactAgent(FnCallAgent):
                 result = self.add_auto_judge(result, auto_judge, judge_engine, messages, question, answer)
                 return result
             round += 1
-            num_llm_calls_available -= 1
+            if not is_unlimited_llm_call_budget(num_llm_calls_available):
+                num_llm_calls_available -= 1
             content = self.call_server(messages, planning_port)
             print(f'Round {round}: {content}')
             if '<tool_response>' in content:
@@ -258,7 +266,10 @@ class MultiTurnReactAgent(FnCallAgent):
                 termination = 'no_tool_call'
                 break
                 
-            if num_llm_calls_available <= 0:
+            if (
+                not is_unlimited_llm_call_budget(num_llm_calls_available)
+                and num_llm_calls_available <= 0
+            ):
                 # 如果调用次数用完，添加最终消息并要求给出答案
                 messages.append({"role": "user", "content": FINAL_MESSAGE})
                 content = self.call_server(messages, planning_port)
@@ -318,7 +329,10 @@ class MultiTurnReactAgent(FnCallAgent):
         # 处理最终结果
         prediction = messages[-1]['content']
         if termination != 'no_tool_call':
-            if num_llm_calls_available <= 0:
+            if (
+                not is_unlimited_llm_call_budget(num_llm_calls_available)
+                and num_llm_calls_available <= 0
+            ):
                 termination = 'exceed_llm_calls'
             else:
                 termination = 'unknown'
