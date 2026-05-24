@@ -301,7 +301,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 })
                 continue
 
-            max_tokens = 108 * 1024
+            max_tokens = self.llm_generate_cfg.get("max_input_tokens", 108 * 1024)
             token_count = self.count_tokens(messages)
             print(f"round: {round}, token count: {token_count}")
 
