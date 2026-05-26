@@ -26,7 +26,7 @@ OBS_START = '<tool_response>'
 OBS_END = '\n</tool_response>'
 
 MAX_LLM_CALL_PER_RUN = int(os.getenv('MAX_LLM_CALL_PER_RUN', 100))
-TASK_TIME_LIMIT_MINUTES = float(os.getenv("WEBEXPLORER_TASK_TIME_LIMIT_MINUTES", "150"))
+TASK_TIME_LIMIT_MINUTES = float(os.getenv("WEBEXPLORER_TASK_TIME_LIMIT_MINUTES", "240"))
 
 
 def is_unlimited_llm_call_budget(num_llm_calls_available: int) -> bool:

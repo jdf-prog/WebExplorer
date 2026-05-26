@@ -34,7 +34,7 @@ MAX_TOKENS_SAFETY_MARGIN = int(os.getenv("MAX_TOKENS_SAFETY_MARGIN", "1024"))
 CONTEXT_SUMMARY_MAX_TOKENS_CAP = int(
     os.getenv("CONTEXT_SUMMARY_MAX_TOKENS_CAP", "32768")
 )
-TASK_TIME_LIMIT_MINUTES = float(os.getenv("WEBEXPLORER_TASK_TIME_LIMIT_MINUTES", "150"))
+TASK_TIME_LIMIT_MINUTES = float(os.getenv("WEBEXPLORER_TASK_TIME_LIMIT_MINUTES", "240"))
 DEFAULT_NAM_MAX_MEMORY_SIZE = 32000
 DEFAULT_NAM_TRIGGER_LOW_FRAC = 0.25
 DEFAULT_NAM_TRIGGER_HIGH_FRAC = 0.75
@@ -2783,6 +2783,13 @@ Directly output the summary content without any other text."""
                     }),
                     final=False,
                 )
+                if (
+                    cumulative_token_usage["context_reset_prompt_tokens"]
+                    >= self.context_total_token_limit
+                ):
+                    termination = "total_token_limit_reached"
+                    prediction = assistant_message.get("content") or ""
+                    return finalize_result(prediction, termination)
                 continue
             if context_action == "summary":
                 if (
