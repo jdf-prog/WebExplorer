@@ -264,7 +264,9 @@ class MultiTurnReactAgent(FnCallAgent):
             os.getenv("MODEL_SERVER_BACKEND", "auto")
         )
         self.context_reset_threshold = float(os.getenv("CONTEXT_RESET_THRESHOLD", "0.3"))
-        keep_system_default = "1" if self.is_deepseek_model else "0"
+        keep_system_default = (
+            "1" if (self.is_deepseek_model or self.is_qwen_model) else "0"
+        )
         self.discard_all_keep_system_prompt = os.getenv(
             "DISCARD_ALL_KEEP_SYSTEM_PROMPT", keep_system_default
         ).strip().lower() in {"1", "true", "yes", "on"}
@@ -303,6 +305,9 @@ class MultiTurnReactAgent(FnCallAgent):
         self.context_total_token_limit = int(
             os.getenv("CONTEXT_TOTAL_TOKEN_LIMIT", "1000000")
         )
+        self.save_context_resets_messages = os.getenv(
+            "SAVE_CONTEXT_RESETS_MESSAGES", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self.tokenizer = None
         self._tokenizer_initialized = False
         self._vllm_dsv4_encoding = None
@@ -2745,6 +2750,7 @@ Directly output the summary content without any other text."""
                 return finalize_result(prediction, termination)
 
             messages_before_reset = len(messages)
+            messages_snapshot = copy.deepcopy(messages) if self.save_context_resets_messages else None
             messages, context_action, reset_info = self.maybe_reset_context(
                 messages,
                 question,
@@ -2766,6 +2772,8 @@ Directly output the summary content without any other text."""
                     "num_llm_calls_available": num_llm_calls_available,
                     **(reset_info or {}),
                 }
+                if messages_snapshot is not None:
+                    reset_event["messages_snapshot"] = messages_snapshot
                 context_reset_events.append(reset_event)
                 self._emit_progress(
                     progress_callback,
